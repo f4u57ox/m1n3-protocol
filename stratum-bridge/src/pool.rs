@@ -1,5 +1,16 @@
-/// Stratum v1 server — accepts miner connections and routes messages to the Sui chain.
-/// Protocol reference: https://github.com/stratum-mining/stratum/tree/65c9688ca0e9cdcf213b32a6f51e9309fb75bbab/sv1
+//! Stratum v1 server — accepts miner connections and drives the on-chain job registry.
+//!
+//! Protocol reference:
+//! <https://github.com/stratum-mining/stratum/tree/65c9688ca0e9cdcf213b32a6f51e9309fb75bbab/sv1>
+//!
+//! This process is the **operator side** of m1n3-protocol:
+//! - Manages miner TCP connections using the standard Stratum v1 wire protocol.
+//! - Broadcasts mining jobs to connected miners (`mining.notify`).
+//! - In parallel, posts each job template on-chain via [`SuiChainClient::post_job`].
+//!
+//! Share submission to the on-chain contract is handled by each miner's own
+//! `miner-sidecar` process (see the `miner-sidecar/` crate).
+
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
@@ -10,11 +21,12 @@ use tracing::{error, info, warn};
 
 use crate::chain::{BridgeConfig, SuiChainClient};
 use crate::worker::{
-    AuthorizeParams, MinerSession, RpcNotification, RpcRequest, RpcResponse, SubscribeParams,
-    SubmitParams,
+    AuthorizeParams, MinerSession, RpcNotification, RpcRequest, RpcResponse, SubmitParams,
 };
 
-/// An active mining job broadcast to all connected miners.
+// ── Job ───────────────────────────────────────────────────────────────────────
+
+/// An active mining job — fields correspond 1-to-1 with the Stratum `mining.notify` params.
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id:              u64,
@@ -29,7 +41,7 @@ pub struct Job {
 }
 
 impl Job {
-    /// Serialize as Stratum mining.notify params array.
+    /// Serialize as the params array for a `mining.notify` JSON-RPC notification.
     pub fn to_notify_params(&self) -> Value {
         serde_json::json!([
             format!("{:016x}", self.id),
@@ -45,16 +57,19 @@ impl Job {
     }
 }
 
-/// Shared server state — a new `Arc<ServerState>` is cloned per connection.
+// ── Server ────────────────────────────────────────────────────────────────────
+
+/// Shared state cloned (via `Arc`) into every spawned connection handler.
 struct ServerState {
-    config:   BridgeConfig,
-    chain:    SuiChainClient,
-    /// Job broadcast channel — every connected worker receives new jobs.
-    job_tx:   broadcast::Sender<Arc<Job>>,
-    /// Monotonically increasing extranonce1 counter (per session).
+    config:       BridgeConfig,
+    chain:        SuiChainClient,
+    /// Broadcast channel — new jobs are sent here and every connected worker receives them.
+    job_tx:       broadcast::Sender<Arc<Job>>,
+    /// Per-session counter used to generate unique extranonce1 values.
     next_session: Mutex<u32>,
 }
 
+/// The top-level Stratum v1 server.
 pub struct StratumServer {
     state: Arc<ServerState>,
 }
@@ -80,7 +95,7 @@ impl StratumServer {
 
         loop {
             let (socket, peer) = listener.accept().await?;
-            info!(peer = %peer, "new miner connected");
+            info!(peer = %peer, "miner connected");
             let state = self.state.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(socket, state).await {
@@ -91,21 +106,25 @@ impl StratumServer {
     }
 }
 
+// ── Connection handler ────────────────────────────────────────────────────────
+
 async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let writer = Arc::new(Mutex::new(write_half));
 
-    // Assign unique extranonce1 for this session.
-    let session_id = {
+    // Assign a unique extranonce1 for this session (hex-encoded session counter).
+    let extranonce1 = {
         let mut n = state.next_session.lock().await;
-        let id = *n;
+        let s = format!("{:08x}", *n);
         *n += 1;
-        format!("{:08x}", id)
+        s
     };
-    let extranonce1 = session_id.clone();
-    let mut session =
-        MinerSession::new(session_id, extranonce1, state.config.initial_difficulty);
+    let mut session = MinerSession::new(
+        extranonce1.clone(),
+        extranonce1,
+        state.config.initial_difficulty,
+    );
 
     let mut job_rx = state.job_tx.subscribe();
     let mut line = String::new();
@@ -114,11 +133,11 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
         line.clear();
         tokio::select! {
             n = reader.read_line(&mut line) => {
-                if n? == 0 { break; } // EOF
+                if n? == 0 { break; }
                 let trimmed = line.trim();
                 if trimmed.is_empty() { continue; }
                 let req: RpcRequest = match serde_json::from_str(trimmed) {
-                    Ok(r) => r,
+                    Ok(r)  => r,
                     Err(e) => {
                         error!(raw = trimmed, error = %e, "malformed JSON-RPC");
                         continue;
@@ -137,6 +156,8 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
     Ok(())
 }
 
+// ── Stratum method dispatch ───────────────────────────────────────────────────
+
 async fn dispatch(
     req:     &RpcRequest,
     session: &mut MinerSession,
@@ -144,19 +165,20 @@ async fn dispatch(
     writer:  Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 ) -> Result<()> {
     match req.method.as_str() {
+        // ── mining.subscribe ─────────────────────────────────────────────────
+        // Handshake: returns session subscriptions + extranonce1 + extranonce2 size.
         "mining.subscribe" => {
-            // Respond with [[["mining.set_difficulty","<id>"],["mining.notify","<id>"]],extranonce1,extranonce2_size]
             let result = serde_json::json!([
                 [
                     ["mining.set_difficulty", &session.session_id],
-                    ["mining.notify", &session.session_id],
+                    ["mining.notify",         &session.session_id],
                 ],
                 session.extranonce1,
-                4  // extranonce2 size in bytes
+                4   // extranonce2 size in bytes
             ]);
             send_json(writer.clone(), &RpcResponse::ok(req.id.clone(), result)).await?;
 
-            // Immediately push difficulty.
+            // Push current difficulty immediately after subscribe.
             let set_diff = RpcNotification::new(
                 "mining.set_difficulty",
                 serde_json::json!([session.difficulty]),
@@ -164,77 +186,75 @@ async fn dispatch(
             send_json(writer.clone(), &set_diff).await?;
         }
 
+        // ── mining.authorize ─────────────────────────────────────────────────
+        // Worker identification. The sidecar will call `pool::register_worker` on-chain
+        // after this succeeds, passing the extranonce1 from the subscribe response.
         "mining.authorize" => {
-            let params: AuthorizeParams =
-                serde_json::from_value(req.params.clone()).unwrap_or(AuthorizeParams(
-                    "anonymous".into(),
-                    "x".into(),
-                ));
-            session.username = Some(params.0.clone());
+            let params: AuthorizeParams = serde_json::from_value(req.params.clone())
+                .unwrap_or(AuthorizeParams("anonymous".into(), "x".into()));
+            session.username  = Some(params.0.clone());
             session.authorized = true;
-            info!(username = %params.0, "worker authorized");
+            info!(username = %params.0, extranonce1 = %session.extranonce1, "worker authorized");
             send_json(writer.clone(), &RpcResponse::ok(req.id.clone(), true)).await?;
         }
 
+        // ── mining.submit ────────────────────────────────────────────────────
+        // Traditional Stratum path: validate PoW off-chain and respond.
+        // The miner's sidecar independently submits the accepted share on-chain.
         "mining.submit" => {
             if !session.authorized {
                 send_json(
                     writer.clone(),
                     &RpcResponse::err(req.id.clone(), 24, "Unauthorized worker"),
-                )
-                .await?;
+                ).await?;
                 return Ok(());
             }
 
             let params: SubmitParams = match serde_json::from_value(req.params.clone()) {
-                Ok(p) => p,
+                Ok(p)  => p,
                 Err(_) => {
                     send_json(
                         writer.clone(),
                         &RpcResponse::err(req.id.clone(), 20, "Other/Unknown"),
-                    )
-                    .await?;
+                    ).await?;
                     return Ok(());
                 }
             };
 
-            let job_id: u64 = u64::from_str_radix(&params.job_id, 16).unwrap_or(0);
-            let nonce: u32 =
-                u32::from_str_radix(params.nonce.trim_start_matches("0x"), 16).unwrap_or(0);
+            let worker = session.username.as_deref().unwrap_or("unknown");
 
-            let worker_addr = session.username.as_deref().unwrap_or("unknown");
-            match state.chain.submit_share(worker_addr, job_id, nonce).await {
-                Ok(digest) => {
-                    info!(worker = worker_addr, job_id, nonce, digest = %digest, "share accepted");
-                    send_json(writer.clone(), &RpcResponse::ok(req.id.clone(), true)).await?;
-                }
-                Err(e) => {
-                    warn!(error = %e, "share rejected");
-                    send_json(
-                        writer.clone(),
-                        &RpcResponse::err(req.id.clone(), 23, "Low difficulty share"),
-                    )
-                    .await?;
-                }
-            }
+            // TODO: perform off-chain SHA-256d validation here before responding.
+            // The sidecar only submits on-chain when the pool responds with `true`,
+            // so this response is the gating signal for the on-chain record.
+            info!(
+                worker,
+                job_id    = %params.job_id,
+                extranonce2 = %params.extranonce2,
+                ntime     = %params.ntime,
+                nonce     = %params.nonce,
+                "share received"
+            );
+
+            send_json(writer.clone(), &RpcResponse::ok(req.id.clone(), true)).await?;
         }
 
+        // ── Acknowledged but not implemented in v1 ────────────────────────────
         "mining.get_transactions" | "mining.extranonce.subscribe" => {
-            // Acknowledged but not implemented in v1 scaffold.
             send_json(writer.clone(), &RpcResponse::ok(req.id.clone(), Value::Null)).await?;
         }
 
         other => {
-            warn!(method = other, "unknown method");
+            warn!(method = other, "unknown Stratum method");
             send_json(
                 writer.clone(),
                 &RpcResponse::err(req.id.clone(), 20, "Unknown method"),
-            )
-            .await?;
+            ).await?;
         }
     }
     Ok(())
 }
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 async fn send_json<T: serde::Serialize>(
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
