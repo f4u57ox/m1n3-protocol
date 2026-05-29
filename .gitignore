@@ -1,0 +1,20 @@
+# Rust
+target/
+Cargo.lock
+
+# Sui build artifacts
+contracts/build/
+contracts/.sui/
+
+# Environment
+.env
+*.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
