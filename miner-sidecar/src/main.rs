@@ -7,13 +7,10 @@
 //!
 //! # Quick start
 //!
-//! ```bash
-//! POOL_HOST=pool.example.com \
-//! POOL_PORT=3333 \
-//! SIDECAR_PORT=3334 \
-//! MINER_KEY=<hex_ed25519_key> \
-//! POOL_OBJECT_ID=0x... \
-//! m1n3-sidecar
+//! Set env vars (see `.env.example`) then:
+//!
+//! ```sh
+//! cargo run --bin m1n3-sidecar
 //! ```
 //!
 //! Then point your ASIC at `stratum+tcp://localhost:3334`.
@@ -39,5 +36,5 @@ async fn main() -> Result<()> {
         "m1n3-sidecar starting"
     );
 
-    proxy::ProxyServer::new(config).run().await
+    proxy::ProxyServer::new(config)?.run().await
 }

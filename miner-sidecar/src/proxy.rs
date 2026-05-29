@@ -1,24 +1,30 @@
-//! Stratum v1 TCP proxy with share interception.
+//! Stratum v1 TCP proxy with share interception and automatic on-chain registration.
 //!
 //! The proxy sits transparently between the miner's hardware and the upstream pool:
 //!
 //! ```text
 //! ASIC/GPU  ──→  sidecar :SIDECAR_PORT  ──→  pool :POOL_PORT
 //!                    │
+//!                    │  on pool {result: true} for mining.authorize
+//!                    ▼
+//!             Sui: pool::register_worker  (signed by miner's own key)
+//!
 //!                    │  on pool {result: true} for mining.submit
 //!                    ▼
-//!             Sui: pool::submit_share  (signed by miner's own key)
+//!             Sui: pool::submit_share     (signed by miner's own key)
 //! ```
 //!
-//! All Stratum message parsing uses [`sv1_api::json_rpc::Message`] from the
-//! stratum-mining reference implementation for real-world ASIC compatibility.
+//! All Stratum message parsing uses [`sv1_api::json_rpc::Message`] for real-world
+//! ASIC (Avalon) compatibility.
 //!
 //! State machine per connection:
 //!   1. `mining.subscribe` response  → capture extranonce1
-//!   2. `mining.notify`              → update stored job template
-//!   3. `mining.submit` (miner→pool) → buffer pending share
-//!   4. `{result: true}` (pool→)     → submit pending share on-chain, clear buffer
-//!   5. `{result: false/error}`      → discard pending share
+//!   2. `mining.authorize` (miner→)  → buffer pending auth (username + rpc_id)
+//!   3. `{result: true}` for auth    → call register_worker on-chain
+//!   4. `mining.notify`              → update stored job template
+//!   5. `mining.submit` (miner→pool) → buffer pending share
+//!   6. `{result: true}` for submit  → submit share on-chain
+//!   7. `{result: false/error}`      → discard pending share
 
 use anyhow::Result;
 use sv1_api::json_rpc::Message;
@@ -33,7 +39,6 @@ use crate::submit::{ChainSubmitter, PendingShare};
 
 // ── Session state ─────────────────────────────────────────────────────────────
 
-/// Current mining job as received via `mining.notify`.
 #[derive(Debug, Clone, Default)]
 struct CurrentJob {
     id:              u64,
@@ -46,7 +51,6 @@ struct CurrentJob {
     n_time:          String,
 }
 
-/// A share submitted by the miner, held until the pool accepts or rejects it.
 #[derive(Debug, Clone)]
 struct PendingSubmit {
     job_id:      u64,
@@ -55,13 +59,20 @@ struct PendingSubmit {
     nonce:       String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAuth {
+    username:    String,
+    rpc_id:      u64,
+}
+
 #[derive(Debug, Default)]
 struct SessionState {
-    extranonce1:    Option<String>,
-    current_job:    Option<CurrentJob>,
-    pending_submit: Option<PendingSubmit>,
-    /// RPC id of the last `mining.submit` sent upstream — used to match the pool's response.
-    pending_rpc_id: Option<u64>,
+    extranonce1:     Option<String>,
+    current_job:     Option<CurrentJob>,
+    pending_submit:  Option<PendingSubmit>,
+    pending_auth:    Option<PendingAuth>,
+    /// RPC id of the last `mining.submit` forwarded upstream.
+    pending_rpc_id:  Option<u64>,
 }
 
 // ── Proxy server ──────────────────────────────────────────────────────────────
@@ -72,9 +83,9 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub fn new(config: SidecarConfig) -> Self {
-        let submitter = Arc::new(ChainSubmitter::new(config.clone()));
-        Self { config, submitter }
+    pub fn new(config: SidecarConfig) -> Result<Self> {
+        let submitter = Arc::new(ChainSubmitter::new(config.clone())?);
+        Ok(Self { config, submitter })
     }
 
     pub async fn run(self) -> Result<()> {
@@ -82,7 +93,7 @@ impl ProxyServer {
         let listener = TcpListener::bind(&addr).await?;
         info!(
             listen   = %addr,
-            upstream = format!("{}:{}", self.config.pool_host, self.config.pool_port),
+            upstream = %format!("{}:{}", self.config.pool_host, self.config.pool_port),
             "m1n3-sidecar proxy listening"
         );
 
@@ -136,10 +147,15 @@ async fn handle_session(
                 let line = ds_line.trim().to_string();
                 if line.is_empty() { continue; }
 
-                // Parse with sv1_api for correctness; intercept mining.submit.
                 if let Ok(Message::StandardRequest(req)) = serde_json::from_str::<Message>(&line) {
-                    if req.method == "mining.submit" {
-                        intercept_miner_submit(&req.params, req.id, &state).await;
+                    match req.method.as_str() {
+                        "mining.submit" => {
+                            intercept_miner_submit(&req.params, req.id, &state).await;
+                        }
+                        "mining.authorize" => {
+                            intercept_miner_authorize(&req.params, req.id, &state).await;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -169,11 +185,25 @@ async fn handle_session(
 
 // ── Interception logic ────────────────────────────────────────────────────────
 
-/// Buffer the share from `mining.submit` before forwarding upstream.
+async fn intercept_miner_authorize(
+    params: &serde_json::Value,
+    rpc_id: u64,
+    state:  &Arc<Mutex<SessionState>>,
+) {
+    let username = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .unwrap_or("anonymous")
+        .to_string();
+
+    debug!(username = %username, "buffering pending authorize");
+    state.lock().await.pending_auth = Some(PendingAuth { username, rpc_id });
+}
+
 async fn intercept_miner_submit(
-    params:    &serde_json::Value,
-    rpc_id:    u64,
-    state:     &Arc<Mutex<SessionState>>,
+    params: &serde_json::Value,
+    rpc_id: u64,
+    state:  &Arc<Mutex<SessionState>>,
 ) {
     let arr = match params.as_array() {
         Some(a) if a.len() >= 5 => a,
@@ -193,7 +223,6 @@ async fn intercept_miner_submit(
     s.pending_rpc_id = Some(rpc_id);
 }
 
-/// Inspect every pool message — capture extranonce1, job templates, and share responses.
 async fn intercept_pool_message(
     msg:       &Message,
     state:     &Arc<Mutex<SessionState>>,
@@ -227,9 +256,9 @@ async fn intercept_pool_message(
             }
         }
 
-        // ── OkResponse — check if it's the subscribe or a share acceptance ────
+        // ── OkResponse — match against pending authorize or submit ────────────
         Message::OkResponse(resp) => {
-            // mining.subscribe response: result is [[subs…], extranonce1, en2_size]
+            // ── subscribe response: capture extranonce1 ───────────────────────
             if let Some(arr) = resp.result.as_array() {
                 if arr.len() == 3 {
                     if let Some(e1) = arr[1].as_str() {
@@ -240,12 +269,42 @@ async fn intercept_pool_message(
                 }
             }
 
-            // Check if this response matches our pending mining.submit.
-            let pending_id = state.lock().await.pending_rpc_id;
+            let mut s = state.lock().await;
+
+            // ── authorize accepted → register worker on-chain ─────────────────
+            if let Some(auth) = &s.pending_auth {
+                if resp.id == auth.rpc_id && resp.result.as_bool() == Some(true) {
+                    let username    = auth.username.clone();
+                    let extranonce1 = s.extranonce1.clone().unwrap_or_default();
+                    s.pending_auth = None;
+                    drop(s); // release lock before spawning
+
+                    let en1_bytes = hex::decode(&extranonce1).unwrap_or_default();
+                    let sub       = submitter.clone();
+                    tokio::spawn(async move {
+                        match sub.register_worker(&username, &en1_bytes).await {
+                            Ok(digest) => info!(
+                                worker = %username,
+                                digest = %digest,
+                                "worker registered on-chain"
+                            ),
+                            Err(e) => error!(
+                                worker = %username,
+                                error  = %e,
+                                "register_worker PTB failed"
+                            ),
+                        }
+                    });
+                    return;
+                }
+            }
+
+            // ── submit accepted → submit share on-chain ───────────────────────
+            let pending_id = s.pending_rpc_id;
             if Some(resp.id) == pending_id {
-                // Pool accepted the share — submit it on-chain.
-                let pending = state.lock().await.pending_submit.take();
-                state.lock().await.pending_rpc_id = None;
+                let pending = s.pending_submit.take();
+                s.pending_rpc_id = None;
+                drop(s); // release lock before spawning
 
                 if let Some(p) = pending {
                     let extranonce2 = hex::decode(&p.extranonce2).unwrap_or_default();
@@ -261,7 +320,7 @@ async fn intercept_pool_message(
                     tokio::spawn(async move {
                         match sub.submit_share(&share).await {
                             Ok(digest) => info!(digest = %digest, "share recorded on-chain"),
-                            Err(e)     => error!(error = %e, "on-chain share submission failed"),
+                            Err(e)     => error!(error = %e, "submit_share PTB failed"),
                         }
                     });
                 }
@@ -270,9 +329,9 @@ async fn intercept_pool_message(
 
         // ── ErrorResponse — pool rejected the share, nothing goes on-chain ─────
         Message::ErrorResponse(resp) => {
-            let pending_id = state.lock().await.pending_rpc_id;
+            let mut s = state.lock().await;
+            let pending_id = s.pending_rpc_id;
             if Some(resp.id) == pending_id {
-                let mut s = state.lock().await;
                 s.pending_submit = None;
                 s.pending_rpc_id = None;
                 debug!("share rejected by pool — not submitted on-chain");
