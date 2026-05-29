@@ -3,7 +3,6 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod pool;
-mod worker;
 mod chain;
 
 #[tokio::main]
