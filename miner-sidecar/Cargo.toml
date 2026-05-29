@@ -1,0 +1,19 @@
+[package]
+name        = "miner-sidecar"
+version     = "0.1.0"
+edition     = "2021"
+description = "Trustless miner-side sidecar — intercepts accepted Stratum shares and submits them on-chain to the m1n3-protocol pool contract, signed with the miner's own Sui key."
+
+[[bin]]
+name = "m1n3-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex                = { workspace = true }
+bytes              = { workspace = true }
