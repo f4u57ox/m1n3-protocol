@@ -7,36 +7,44 @@ The miner sidecar is a lightweight process that runs alongside your mining hardw
 ## How it works
 
 ```
-Your ASIC  ──→  sidecar :3334  ──→  pool :3333
-                    │
-                    │  pool accepted share
-                    ▼
-             Sui blockchain
-             pool::submit_share  ← signed with YOUR key
+Your ASIC (Avalon)  ──→  sidecar :3334  ──→  pool :3333
+                              │
+                              │  pool accepted mining.authorize
+                              ▼
+                       Sui devnet: pool::register_worker  ← signed with YOUR key
+
+                              │  pool accepted share
+                              ▼
+                       Sui devnet: pool::submit_share     ← signed with YOUR key
 ```
 
-The sidecar is 100% transparent: your ASIC never knows it's there, and the pool never knows either.
+The sidecar is 100% transparent: your ASIC never knows it's there, and the pool never knows either. Worker registration and share submission happen automatically with no manual steps.
 
 ## Prerequisites
 
 - Rust toolchain (stable, ≥ 1.75) — only needed to build
-- A Sui wallet with a small amount of SUI for gas (~0.5 SUI is plenty to start)
-- The Pool object ID from the operator
+- A Sui wallet funded with some devnet SUI for gas (~1 SUI covers thousands of share submissions)
+- The Pool object ID and Package ID from the operator
 
 ## 1. Generate your Sui keypair
 
 If you don't already have a Sui wallet:
 
 ```bash
+sui client switch --env devnet
 sui keytool generate ed25519
 ```
 
-This outputs your address and private key. Fund the address with some SUI for gas fees.
+Get devnet SUI from the faucet:
+```bash
+sui client faucet
+```
 
 Export your private key for the sidecar:
 
 ```bash
 sui keytool export --key-identity <your_address>
+# Copy the "privateKey" value — starts with suiprivkey1…
 ```
 
 ## 2. Build the sidecar
@@ -53,59 +61,60 @@ cargo build --release --bin m1n3-sidecar
 cp .env.example .env.sidecar
 ```
 
-Edit `.env.sidecar` — only the sidecar section matters:
+Edit `.env.sidecar` — fill in the sidecar section:
 
 ```bash
-POOL_HOST=pool.example.com    # Address of the m1n3-protocol pool
+POOL_HOST=192.168.1.10       # IP of the machine running stratum-bridge
 POOL_PORT=3333
-SIDECAR_PORT=3334             # Local port — point your ASIC here
-SUI_RPC_URL=https://fullnode.testnet.sui.io:443
-MINER_KEY=<your_ed25519_key_hex>
-POOL_OBJECT_ID=<pool_object_id_from_operator>
+SIDECAR_PORT=3334            # Point your Avalon at this port
+SUI_RPC_URL=https://fullnode.devnet.sui.io:443
+MINER_KEY=suiprivkey1...     # from sui keytool export
+POOL_OBJECT_ID=0x...         # from the pool operator
+PACKAGE_ID=0x...             # from the pool operator
 RUST_LOG=info
 ```
 
-## 4. Register on-chain
-
-Before submitting shares, you must register your worker on-chain once. The sidecar will eventually do this automatically; for now use the Sui CLI:
+## 4. Run the sidecar
 
 ```bash
-# Your extranonce1 appears in the sidecar logs after the first mining.subscribe
-# Look for: "captured extranonce1 from subscribe response"
-
-sui client call \
-  --package <PACKAGE_ID> \
-  --module pool \
-  --function register_worker \
-  --args <POOL_OBJECT_ID> '"worker1.default"' '"<extranonce1_hex>"' \
-  --gas-budget 5000000
+env $(grep -v '^#' .env.sidecar | xargs) ./target/release/m1n3-sidecar
 ```
 
-## 5. Run the sidecar
+Expected log output:
+```
+INFO m1n3-sidecar proxy listening listen=0.0.0.0:3334 upstream=192.168.1.10:3333
+INFO sidecar chain submitter initialized miner=0x... pool=0x... package=0x...
+```
+
+## 5. Configure the Avalon miner
+
+In the Avalon web UI (or via CGMiner's config), set:
+
+```
+Pool 1 URL: stratum+tcp://<sidecar-machine-ip>:3334
+Worker:     <anything>.worker1   (this becomes your on-chain worker name)
+Password:   x
+```
+
+After connecting, the sidecar logs will show:
+```
+INFO ASIC connected to sidecar peer=...
+INFO captured extranonce1 from subscribe extranonce1=...
+INFO worker registered on-chain worker=<username> digest=0x...
+```
+
+Registration is now automatic — no manual `sui client call` needed.
+
+## 6. Verify on-chain state
+
+After running for a few minutes:
 
 ```bash
-env $(cat .env.sidecar | xargs) ./target/release/m1n3-sidecar
-```
+# Check for WorkerRegistered and ShareAccepted events
+sui client events --package <PACKAGE_ID>
 
-Then point your ASIC at:
-```
-stratum+tcp://localhost:3334
-```
-
-(Replace `localhost` with the sidecar machine's IP if the ASIC is on a different host.)
-
-## 6. Verify
-
-After running for a few minutes, check your on-chain share count:
-
-```bash
-sui client object <POOL_OBJECT_ID>
-```
-
-Or watch for `ShareAccepted` events:
-
-```bash
-sui client events --package <PACKAGE_ID> | grep ShareAccepted
+# Inspect your worker entry in the pool
+sui client object <POOL_OBJECT_ID> --json | jq '.data.content.fields.workers'
 ```
 
 ## 7. Claim your rewards
@@ -128,7 +137,9 @@ Funds go directly to your wallet — no operator approval needed.
 | Symptom | Likely cause |
 |---|---|
 | `POOL_HOST is required` | Missing env var — check `.env.sidecar` |
-| `MINER_KEY is required` | Missing or empty key |
-| Shares not appearing on-chain | Worker not registered — see step 4 |
-| `EInvalidShare` in Sui logs | extranonce1 mismatch — re-register with correct value from logs |
-| Gas errors | Insufficient SUI in wallet — top up and retry |
+| `invalid MINER_KEY` | Key format wrong — must be `suiprivkey1…` from `sui keytool export` |
+| `PACKAGE_ID is required` | Get this from the pool operator |
+| `operator has no SUI coins` | Run `sui client faucet` to top up |
+| `EAlreadyRegistered` in logs | Worker already registered — safe to ignore |
+| `EInvalidShare` in Sui logs | extranonce1 mismatch — restart sidecar to re-register |
+| Gas errors | Insufficient SUI — run `sui client faucet` |
