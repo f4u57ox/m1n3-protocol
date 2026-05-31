@@ -2,9 +2,10 @@ use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod pool;
-mod worker;
+mod bitcoin_rpc;
 mod chain;
+mod pool;
+mod pow;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,5 +16,5 @@ async fn main() -> Result<()> {
     let config = chain::BridgeConfig::from_env()?;
     info!("m1n3-protocol bridge starting on {}:{}", config.host, config.port);
 
-    pool::StratumServer::new(config).run().await
+    pool::StratumServer::new(config).await?.run().await
 }

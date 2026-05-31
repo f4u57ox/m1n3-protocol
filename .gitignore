@@ -1,6 +1,7 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock is intentionally tracked — this workspace produces binaries
+# (m1n3-bridge, m1n3-sidecar) and lock files ensure reproducible builds.
 
 # Sui build artifacts
 contracts/build/

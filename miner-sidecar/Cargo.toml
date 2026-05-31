@@ -1,11 +1,11 @@
 [package]
-name        = "stratum-bridge"
+name        = "miner-sidecar"
 version     = "0.1.0"
 edition     = "2021"
-description = "Off-chain Stratum v1 ↔ Sui bridge for m1n3-protocol"
+description = "Trustless miner-side sidecar — intercepts accepted Stratum shares and submits them on-chain to the m1n3-protocol pool contract, signed with the miner's own Sui key."
 
 [[bin]]
-name = "m1n3-bridge"
+name = "m1n3-sidecar"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,9 +16,7 @@ anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex                = { workspace = true }
-sha2               = { workspace = true }
 bytes              = { workspace = true }
 sv1_api            = { workspace = true }
-reqwest            = { workspace = true }
 sui-client         = { workspace = true }
 base64             = { workspace = true }
