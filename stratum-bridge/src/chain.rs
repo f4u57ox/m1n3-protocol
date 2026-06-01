@@ -14,6 +14,7 @@ use sui_client::{
 };
 
 use crate::pool::Job;
+use crate::pow::compute_pool_scalar;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -27,13 +28,10 @@ pub struct BridgeConfig {
     pub pool_object_id:   String,
     /// Deployed package ID from `sui client publish`.
     pub package_id:       String,
-    /// Stratum difficulty sent to miners via `mining.set_difficulty`.
-    /// Low value = easier for ASICs; keep at 512–2048 for Nano/Mini hardware.
+    /// Stratum difficulty floor — miners never go below this (VARDIFF floor).
     pub initial_difficulty: u64,
-    /// Pool scalar for off-chain PoW check — must match `pool::set_difficulty` on-chain.
-    /// pool_target = nbits_target × pool_scalar; large values saturate to "accept all".
-    /// For Avalon Nano/Mini on mainnet set to ≥ 1_000_000_000_000_000.
-    pub pool_scalar: u64,
+    /// VARDIFF target: how many shares per minute across all miners.
+    pub target_shares_per_min: u64,
     /// SUI reward added to pool treasury per job, in MIST.
     pub reward_mist:      u64,
     // ── Bitcoin Core RPC ─────────────────────────────────────────────────────
@@ -64,10 +62,10 @@ impl BridgeConfig {
                 .unwrap_or_else(|_| "512".to_string())
                 .parse()
                 .context("INITIAL_DIFFICULTY must be a u64")?,
-            pool_scalar: std::env::var("POOL_SCALAR")
-                .unwrap_or_else(|_| "1000000000000000".to_string())
+            target_shares_per_min: std::env::var("TARGET_SHARES_PER_MIN")
+                .unwrap_or_else(|_| "10".to_string())
                 .parse()
-                .context("POOL_SCALAR must be a u64")?,
+                .context("TARGET_SHARES_PER_MIN must be a u64")?,
             reward_mist: std::env::var("REWARD_MIST")
                 .unwrap_or_else(|_| "100000000".to_string())
                 .parse()
@@ -190,11 +188,34 @@ impl SuiChainClient {
         Ok(digest)
     }
 
-    /// Sync the on-chain pool difficulty to match POOL_SCALAR from config.
+    /// Set the on-chain pool difficulty derived from the current n_bits and initial_difficulty.
     ///
-    /// The pool is created with DEFAULT_DIFFICULTY = 1_000, which is far too strict
-    /// for Avalon hardware at mainnet difficulty. Call this once at bridge startup.
-    pub async fn init_pool_difficulty(&self) -> Result<()> {
+    /// Called once when the first block template arrives.
+    pub async fn init_pool_difficulty(&self, n_bits: u32) -> Result<()> {
+        let pool_scalar = compute_pool_scalar(n_bits, self.config.initial_difficulty);
+        self.set_on_chain_difficulty(pool_scalar).await?;
+        info!(
+            n_bits     = format!("{:08x}", n_bits),
+            pool_scalar,
+            "on-chain pool difficulty initialized"
+        );
+        Ok(())
+    }
+
+    /// Update on-chain difficulty after a VARDIFF adjustment.
+    pub async fn update_on_chain_difficulty(&self, n_bits: u32, new_diff: u64) -> Result<()> {
+        let pool_scalar = compute_pool_scalar(n_bits, new_diff);
+        self.set_on_chain_difficulty(pool_scalar).await?;
+        info!(
+            n_bits     = format!("{:08x}", n_bits),
+            stratum_diff = new_diff,
+            pool_scalar,
+            "on-chain difficulty updated via VARDIFF"
+        );
+        Ok(())
+    }
+
+    async fn set_on_chain_difficulty(&self, pool_scalar: u64) -> Result<()> {
         let pool_obj = self.rpc.get_object(&self.config.pool_object_id).await?;
         let initial_shared_version = SuiRpcClient::parse_shared_version(
             pool_obj.owner.as_ref().context("pool object has no owner field")?,
@@ -205,17 +226,12 @@ impl SuiChainClient {
 
         let mut ptb = PtbBuilder::new();
         let pool_arg = ptb.shared_object(self.pool_id, initial_shared_version, true);
-        let diff_arg = ptb.pure_u64(self.config.pool_scalar)?;
+        let diff_arg = ptb.pure_u64(pool_scalar)?;
         ptb.move_call(self.package_id, "pool", "set_difficulty", vec![pool_arg, diff_arg]);
 
         let tx_b64  = ptb.build(self.keypair.address, gas_ref, gas_price, 5_000_000)?;
         let sig_b64 = self.keypair.sign_transaction(&STANDARD.decode(&tx_b64).unwrap());
-        let digest  = self.rpc.execute_transaction(&tx_b64, &sig_b64).await?;
-        info!(
-            difficulty = self.config.pool_scalar,
-            digest     = %digest,
-            "on-chain pool difficulty initialized"
-        );
+        let _digest = self.rpc.execute_transaction(&tx_b64, &sig_b64).await?;
         Ok(())
     }
 }

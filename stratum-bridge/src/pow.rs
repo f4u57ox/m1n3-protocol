@@ -72,15 +72,20 @@ pub fn nbits_to_target(n_bits: u32) -> [u8; 32] {
     t
 }
 
-/// Divide target by `difficulty` (integer, big-endian 32-byte).
-/// Higher difficulty → lower target → harder to find a valid hash.
-pub fn scale_target(mut target: [u8; 32], difficulty: u64) -> [u8; 32] {
-    if difficulty <= 1 { return target; }
-    let mut remainder: u128 = 0;
-    for byte in target.iter_mut() {
-        remainder = (remainder << 8) | (*byte as u128);
-        *byte = (remainder / difficulty as u128) as u8;
-        remainder %= difficulty as u128;
+/// Multiply target by `scalar` (big-endian 32-byte integer × u64).
+/// Mirrors share.move::scale_target exactly.
+/// Higher scalar → larger target → easier to find a valid hash.
+/// Overflows saturate to 0xFF…FF (every hash is valid).
+pub fn scale_target(mut target: [u8; 32], scalar: u64) -> [u8; 32] {
+    if scalar <= 1 { return target; }
+    let mut carry: u64 = 0;
+    for byte in target.iter_mut().rev() {
+        let product = (*byte as u64) * scalar + carry;
+        *byte = (product & 0xFF) as u8;
+        carry = product >> 8;
+    }
+    if carry > 0 {
+        target = [0xFF; 32]; // overflow → every hash is valid
     }
     target
 }
@@ -97,22 +102,23 @@ pub fn meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
 
 // ── Full share verification ───────────────────────────────────────────────────
 
-/// Verify a submitted share against the job template and pool difficulty.
+/// Verify a submitted share against the job template and pool difficulty scalar.
 ///
-/// Returns `true` if the share meets `difficulty × nbits_target`.
+/// Returns `true` if `hash ≤ nbits_target × pool_scalar`.
+/// This is identical to `share::verify_share` in the Move contract.
 /// All byte slices are raw (not hex); caller decodes from Stratum hex fields.
 pub fn verify_share(
-    cb1:        &[u8],
-    cb2:        &[u8],
-    en1:        &[u8],
-    en2:        &[u8],
-    branches:   &[[u8; 32]],
-    version:    u32,
-    prev_hash:  &[u8; 32],
-    n_bits:     u32,
-    n_time:     u32,
-    nonce:      u32,
-    difficulty: u64,
+    cb1:         &[u8],
+    cb2:         &[u8],
+    en1:         &[u8],
+    en2:         &[u8],
+    branches:    &[[u8; 32]],
+    version:     u32,
+    prev_hash:   &[u8; 32],
+    n_bits:      u32,
+    n_time:      u32,
+    nonce:       u32,
+    pool_scalar: u64,
 ) -> bool {
     let coinbase   = build_coinbase(cb1, en1, en2, cb2);
     let cb_hash    = sha256d(&coinbase);
@@ -121,6 +127,42 @@ pub fn verify_share(
     let block_hash = sha256d(&header);
 
     let base_target = nbits_to_target(n_bits);
-    let target      = scale_target(base_target, difficulty);
-    meets_target(&block_hash, &target)
+    let pool_target = scale_target(base_target, pool_scalar);
+    meets_target(&block_hash, &pool_target)
+}
+
+/// Convert a Stratum difficulty into a pool_scalar for the given n_bits compact target.
+///
+/// pool_scalar = diff_1_target / (network_target × stratum_difficulty)
+///
+/// Returns u64::MAX (accept every hash) on overflow or degenerate inputs.
+pub fn compute_pool_scalar(n_bits: u32, stratum_difficulty: u64) -> u64 {
+    let exp  = (n_bits >> 24) as u32;
+    let mant = n_bits & 0x00ff_ffff;
+    if mant == 0 || stratum_difficulty == 0 { return u64::MAX; }
+    let net_shift  = 8u32.saturating_mul(exp.saturating_sub(3));
+    let shift_diff = 208u32.saturating_sub(net_shift);
+    if shift_diff >= 64 { return u64::MAX; }
+    let numerator: u128   = 65535u128 << shift_diff;
+    let denominator: u128 = mant as u128 * stratum_difficulty as u128;
+    if denominator == 0 { return u64::MAX; }
+    (numerator / denominator).min(u64::MAX as u128) as u64
+}
+
+/// Same computation as verify_share but returns (hash_hex, target_hex) for diagnostics.
+pub fn debug_share(
+    cb1: &[u8], cb2: &[u8], en1: &[u8], en2: &[u8], branches: &[[u8; 32]],
+    version: u32, prev_hash: &[u8; 32], n_bits: u32, n_time: u32, nonce: u32,
+    pool_scalar: u64,
+) -> (String, String) {
+    let coinbase   = build_coinbase(cb1, en1, en2, cb2);
+    let cb_hash    = sha256d(&coinbase);
+    let root       = merkle_root(cb_hash, branches);
+    let header     = pack_header(version, prev_hash, &root, n_time, n_bits, nonce);
+    let block_hash = sha256d(&header);
+    let base_target = nbits_to_target(n_bits);
+    let pool_target = scale_target(base_target, pool_scalar);
+    let mut rev = block_hash;
+    rev.reverse();
+    (hex::encode(rev), hex::encode(pool_target))
 }
