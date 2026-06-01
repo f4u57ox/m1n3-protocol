@@ -2,11 +2,16 @@
 
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import { Sun, Moon, Menu, X } from "lucide-react";
 import Image from "next/image";
 
-const navLinks = [
+const internalLinks = [
+  { href: "/pool", label: "Pool" },
+];
+
+const externalLinks = [
   { href: "https://github.com/f4u57ox/m1n3-protocol", label: "GitHub" },
   { href: "https://github.com/f4u57ox/m1n3-protocol/tree/main/docs", label: "Docs" },
 ];
@@ -98,6 +103,7 @@ function MatrixRain() {
 
 export function Navigation() {
   const { theme, setTheme } = useTheme();
+  const pathname = usePathname();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
 
@@ -137,7 +143,20 @@ export function Navigation() {
 
         {/* Desktop nav */}
         <div className="hidden md:flex items-center gap-1">
-          {navLinks.map((link) => (
+          {internalLinks.map((link) => (
+            <Link
+              key={link.href}
+              href={link.href}
+              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors hover:text-foreground hover:bg-accent ${
+                pathname === link.href
+                  ? "text-foreground bg-accent"
+                  : "text-muted-foreground"
+              }`}
+            >
+              {link.label}
+            </Link>
+          ))}
+          {externalLinks.map((link) => (
             <Link
               key={link.href}
               href={link.href}
@@ -177,7 +196,21 @@ export function Navigation() {
         {mobileMenuOpen && (
           <div className="absolute left-0 top-full w-full border-b bg-card shadow-md md:hidden z-50">
             <div className="flex flex-col p-2 gap-1">
-              {navLinks.map((link) => (
+              {internalLinks.map((link) => (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  onClick={() => setMobileMenuOpen(false)}
+                  className={`block px-4 py-2.5 rounded-md text-sm font-medium transition-colors hover:text-foreground hover:bg-accent ${
+                    pathname === link.href
+                      ? "text-foreground bg-accent"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {link.label}
+                </Link>
+              ))}
+              {externalLinks.map((link) => (
                 <Link
                   key={link.href}
                   href={link.href}
