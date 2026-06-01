@@ -8,7 +8,6 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tracing::{debug, info};
 
 use sui_client::{
-    bcs_types::Argument as PtbArg,
     rpc::{parse_object_id, SuiRpcClient},
     PtbBuilder, SuiKeypair,
 };
@@ -32,8 +31,6 @@ pub struct BridgeConfig {
     pub initial_difficulty: u64,
     /// VARDIFF target: how many shares per minute across all miners.
     pub target_shares_per_min: u64,
-    /// SUI reward added to pool treasury per job, in MIST.
-    pub reward_mist:      u64,
     // ── Bitcoin Core RPC ─────────────────────────────────────────────────────
     pub bitcoin_rpc_url:  String,
     pub bitcoin_rpc_user: String,
@@ -66,10 +63,6 @@ impl BridgeConfig {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("TARGET_SHARES_PER_MIN must be a u64")?,
-            reward_mist: std::env::var("REWARD_MIST")
-                .unwrap_or_else(|_| "100000000".to_string())
-                .parse()
-                .context("REWARD_MIST must be a u64")?,
             bitcoin_rpc_url: std::env::var("BITCOIN_RPC_URL")
                 .context("BITCOIN_RPC_URL is required (e.g. http://127.0.0.1:8332)")?,
             bitcoin_rpc_user: std::env::var("BITCOIN_RPC_USER")
@@ -164,16 +157,15 @@ impl SuiChainClient {
         let version_arg   = ptb.pure_u32(version)?;
         let n_bits_arg    = ptb.pure_u32(n_bits)?;
         let n_time_arg    = ptb.pure_u32(n_time)?;
-        let reward_arg    = ptb.pure_u64(self.config.reward_mist)?;
 
-        // MoveCall: pool::post_job — pass GasCoin directly as &mut Coin<SUI> payment
+        // MoveCall: pool::post_job — no SUI payment; just registers the template
         ptb.move_call(
             self.package_id,
             "pool",
             "post_job",
             vec![
                 pool_arg, prev_hash_arg, cb1_arg, cb2_arg, branches_arg,
-                version_arg, n_bits_arg, n_time_arg, reward_arg, PtbArg::GasCoin,
+                version_arg, n_bits_arg, n_time_arg,
             ],
         );
 

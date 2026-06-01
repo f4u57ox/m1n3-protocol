@@ -207,15 +207,13 @@ impl StratumServer {
                                 "new job from getblocktemplate"
                             );
 
-                            // First job: set on-chain difficulty and push it to miners
+                            // First job: init on-chain difficulty inline (sequential with
+                            // post_job spawn below) to avoid gas coin lock conflict.
                             if job_counter == 1 {
-                                let chain     = state.chain.clone();
                                 let init_diff = *state.global_difficulty.read().await;
-                                tokio::spawn(async move {
-                                    if let Err(e) = chain.init_pool_difficulty(n_bits).await {
-                                        error!(error = %e, "init_pool_difficulty failed");
-                                    }
-                                });
+                                if let Err(e) = state.chain.init_pool_difficulty(n_bits).await {
+                                    error!(error = %e, "init_pool_difficulty failed");
+                                }
                                 let _ = state.diff_tx.send(init_diff);
                             }
 

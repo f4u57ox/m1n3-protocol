@@ -146,6 +146,7 @@ async fn handle_session(
                 if n? == 0 { break; }
                 let line = ds_line.trim().to_string();
                 if line.is_empty() { continue; }
+                info!(raw = %line, "ASIC→pool");
 
                 if let Ok(Message::StandardRequest(req)) = serde_json::from_str::<Message>(&line) {
                     match req.method.as_str() {
@@ -169,6 +170,7 @@ async fn handle_session(
                 if n? == 0 { break; }
                 let line = us_line.trim().to_string();
                 if line.is_empty() { continue; }
+                info!(raw = %line, "pool→ASIC");
 
                 if let Ok(msg) = serde_json::from_str::<Message>(&line) {
                     intercept_pool_message(&msg, &state, &submitter).await;
