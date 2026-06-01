@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
-use crate::bitcoin_rpc::{BitcoinRpcClient, build_coinbase_parts};
+use crate::bitcoin_rpc::{BitcoinRpcClient, build_coinbase_parts, build_merkle_branches};
 use crate::chain::{BridgeConfig, SuiChainClient};
 use crate::pow;
 
@@ -144,7 +144,8 @@ impl StratumServer {
                                 prev_hash:       tmpl.previousblockhash.clone(),
                                 coinbase1:       cb1,
                                 coinbase2:       cb2,
-                                merkle_branches: vec![], // transactions added in later phase
+                                merkle_branches: build_merkle_branches(&tmpl.transactions)
+                                    .iter().map(hex::encode).collect(),
                                 version:         format!("{:08x}", tmpl.version),
                                 n_bits:          tmpl.bits.clone(),
                                 n_time:          format!("{:08x}", tmpl.curtime),

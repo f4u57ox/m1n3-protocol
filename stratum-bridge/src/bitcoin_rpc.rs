@@ -9,6 +9,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
 
+use crate::pow::sha256d;
+
 // ── RPC client ────────────────────────────────────────────────────────────────
 
 pub struct BitcoinRpcClient {
@@ -22,11 +24,17 @@ pub struct BitcoinRpcClient {
 #[derive(Debug, Deserialize)]
 pub struct BlockTemplate {
     pub version:           u32,
-    pub previousblockhash: String,  // 64-char hex (internal byte order)
+    pub previousblockhash: String,  // 64-char hex, display (big-endian) byte order
     pub coinbasevalue:     u64,     // satoshis available to the coinbase output
     pub bits:              String,  // compact target, e.g. "1d00ffff"
     pub curtime:           u32,
     pub height:            u32,
+    pub transactions:      Vec<BitcoinTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitcoinTransaction {
+    pub txid: String,
 }
 
 impl BitcoinRpcClient {
@@ -67,6 +75,47 @@ impl BitcoinRpcClient {
 
         resp.result.context("getblocktemplate returned null result")
     }
+}
+
+// ── Merkle branch construction ────────────────────────────────────────────────
+
+/// Build the Stratum `merkle_branches` array from `getblocktemplate` transactions.
+///
+/// Stratum's merkle_branches are the right-side branch hashes that pair with
+/// the coinbase hash at each level of the merkle tree, from leaf to root.
+/// The miner reconstructs the root as: root = reduce(sha256d(running || branch)).
+///
+/// Algorithm: each iteration pushes hashes[0] as a branch node, then reduces
+/// hashes[1..] into the next tree level (duplicate last node if count is odd).
+pub fn build_merkle_branches(transactions: &[BitcoinTransaction]) -> Vec<[u8; 32]> {
+    let mut hashes: Vec<[u8; 32]> = transactions
+        .iter()
+        .filter_map(|tx| {
+            let mut bytes = hex::decode(&tx.txid).ok()?;
+            bytes.reverse(); // display → internal byte order
+            bytes.try_into().ok()
+        })
+        .collect();
+
+    let mut branches = Vec::new();
+
+    while !hashes.is_empty() {
+        branches.push(hashes[0]);
+        let mut next_level = Vec::new();
+        let mut i = 1;
+        while i < hashes.len() {
+            let left  = hashes[i];
+            let right = if i + 1 < hashes.len() { hashes[i + 1] } else { hashes[i] };
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next_level.push(sha256d(&pair));
+            i += 2;
+        }
+        hashes = next_level;
+    }
+
+    branches
 }
 
 // ── Coinbase construction ─────────────────────────────────────────────────────
