@@ -6,6 +6,8 @@ target/
 # Sui build artifacts
 contracts/build/
 contracts/.sui/
+contracts/*.key
+*.keystore
 
 # Environment
 .env
