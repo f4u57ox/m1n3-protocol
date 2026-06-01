@@ -27,7 +27,13 @@ pub struct BridgeConfig {
     pub pool_object_id:   String,
     /// Deployed package ID from `sui client publish`.
     pub package_id:       String,
+    /// Stratum difficulty sent to miners via `mining.set_difficulty`.
+    /// Low value = easier for ASICs; keep at 512–2048 for Nano/Mini hardware.
     pub initial_difficulty: u64,
+    /// Pool scalar for off-chain PoW check — must match `pool::set_difficulty` on-chain.
+    /// pool_target = nbits_target × pool_scalar; large values saturate to "accept all".
+    /// For Avalon Nano/Mini on mainnet set to ≥ 1_000_000_000_000_000.
+    pub pool_scalar: u64,
     /// SUI reward added to pool treasury per job, in MIST.
     pub reward_mist:      u64,
     // ── Bitcoin Core RPC ─────────────────────────────────────────────────────
@@ -55,9 +61,13 @@ impl BridgeConfig {
             package_id: std::env::var("PACKAGE_ID")
                 .context("PACKAGE_ID is required")?,
             initial_difficulty: std::env::var("INITIAL_DIFFICULTY")
-                .unwrap_or_else(|_| "1000".to_string())
+                .unwrap_or_else(|_| "512".to_string())
                 .parse()
                 .context("INITIAL_DIFFICULTY must be a u64")?,
+            pool_scalar: std::env::var("POOL_SCALAR")
+                .unwrap_or_else(|_| "1000000000000000".to_string())
+                .parse()
+                .context("POOL_SCALAR must be a u64")?,
             reward_mist: std::env::var("REWARD_MIST")
                 .unwrap_or_else(|_| "100000000".to_string())
                 .parse()
@@ -111,8 +121,12 @@ impl SuiChainClient {
         debug!(job_id = job.id, n_bits = %job.n_bits, "building post_job PTB");
 
         // ── Decode hex fields from the Job struct ─────────────────────────────
-        let prev_hash_bytes = hex::decode(&job.prev_hash)
+        // GBT previousblockhash is in display (big-endian) byte order.
+        // The block header and the off-chain PoW check both use internal
+        // (little-endian) byte order, so reverse to match.
+        let mut prev_hash_bytes = hex::decode(&job.prev_hash)
             .context("invalid prev_hash hex")?;
+        prev_hash_bytes.reverse();
         let cb1_bytes = hex::decode(&job.coinbase1)
             .context("invalid coinbase1 hex")?;
         let cb2_bytes = hex::decode(&job.coinbase2)
@@ -154,19 +168,14 @@ impl SuiChainClient {
         let n_time_arg    = ptb.pure_u32(n_time)?;
         let reward_arg    = ptb.pure_u64(self.config.reward_mist)?;
 
-        // SplitCoins(GasCoin, [reward_mist]) → payment coin
-        let split_amount_arg = ptb.pure_u64(self.config.reward_mist)?;
-        let split_results = ptb.split_coins(PtbArg::GasCoin, &[split_amount_arg]);
-        let payment_arg = split_results[0];
-
-        // MoveCall: pool::post_job
+        // MoveCall: pool::post_job — pass GasCoin directly as &mut Coin<SUI> payment
         ptb.move_call(
             self.package_id,
             "pool",
             "post_job",
             vec![
                 pool_arg, prev_hash_arg, cb1_arg, cb2_arg, branches_arg,
-                version_arg, n_bits_arg, n_time_arg, reward_arg, payment_arg,
+                version_arg, n_bits_arg, n_time_arg, reward_arg, PtbArg::GasCoin,
             ],
         );
 
@@ -179,5 +188,34 @@ impl SuiChainClient {
         let digest = self.rpc.execute_transaction(&tx_b64, &sig_b64).await?;
         info!(job_id = job.id, digest = %digest, "job posted on-chain");
         Ok(digest)
+    }
+
+    /// Sync the on-chain pool difficulty to match POOL_SCALAR from config.
+    ///
+    /// The pool is created with DEFAULT_DIFFICULTY = 1_000, which is far too strict
+    /// for Avalon hardware at mainnet difficulty. Call this once at bridge startup.
+    pub async fn init_pool_difficulty(&self) -> Result<()> {
+        let pool_obj = self.rpc.get_object(&self.config.pool_object_id).await?;
+        let initial_shared_version = SuiRpcClient::parse_shared_version(
+            pool_obj.owner.as_ref().context("pool object has no owner field")?,
+        )?;
+        let gas_coin  = self.rpc.get_first_coin(&self.keypair.address_hex()).await?;
+        let gas_ref   = SuiRpcClient::coin_to_object_ref(&gas_coin)?;
+        let gas_price = self.rpc.get_reference_gas_price().await?;
+
+        let mut ptb = PtbBuilder::new();
+        let pool_arg = ptb.shared_object(self.pool_id, initial_shared_version, true);
+        let diff_arg = ptb.pure_u64(self.config.pool_scalar)?;
+        ptb.move_call(self.package_id, "pool", "set_difficulty", vec![pool_arg, diff_arg]);
+
+        let tx_b64  = ptb.build(self.keypair.address, gas_ref, gas_price, 5_000_000)?;
+        let sig_b64 = self.keypair.sign_transaction(&STANDARD.decode(&tx_b64).unwrap());
+        let digest  = self.rpc.execute_transaction(&tx_b64, &sig_b64).await?;
+        info!(
+            difficulty = self.config.pool_scalar,
+            digest     = %digest,
+            "on-chain pool difficulty initialized"
+        );
+        Ok(())
     }
 }

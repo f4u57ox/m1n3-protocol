@@ -98,6 +98,7 @@ pub struct StratumServer {
 impl StratumServer {
     pub async fn new(config: BridgeConfig) -> Result<Self> {
         let chain = Arc::new(SuiChainClient::new(config.clone())?);
+        chain.init_pool_difficulty().await?;
         let (job_tx, _) = broadcast::channel(32);
         Ok(Self {
             state: Arc::new(ServerState {
@@ -310,11 +311,14 @@ async fn dispatch(
             }
 
             let params    = &req.params;
-            let job_id_hex = params.get(1).and_then(|v| v.as_str()).unwrap_or("0");
-            let en2_hex    = params.get(2).and_then(|v| v.as_str()).unwrap_or("");
-            let ntime_hex  = params.get(3).and_then(|v| v.as_str()).unwrap_or("0");
-            let nonce_hex  = params.get(4).and_then(|v| v.as_str()).unwrap_or("0");
-            let worker     = session.username.as_deref().unwrap_or("unknown");
+            let job_id_hex   = params.get(1).and_then(|v| v.as_str()).unwrap_or("0");
+            let en2_hex      = params.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            let ntime_hex    = params.get(3).and_then(|v| v.as_str()).unwrap_or("0");
+            let nonce_hex    = params.get(4).and_then(|v| v.as_str()).unwrap_or("0");
+            let version_bits = params.get(5).and_then(|v| v.as_str())
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let worker       = session.username.as_deref().unwrap_or("unknown");
 
             // Resolve current job for verification
             let job_opt = state.current_job.lock().await.clone();
@@ -345,25 +349,34 @@ async fn dispatch(
                     hex::decode(b).ok().and_then(|v| v.try_into().ok())
                 })
                 .collect();
-            let prev_hash: [u8; 32] = hex::decode(&job.prev_hash)
+            let mut prev_hash: [u8; 32] = hex::decode(&job.prev_hash)
                 .unwrap_or_default()
                 .try_into()
                 .unwrap_or([0u8; 32]);
-            let version = u32::from_str_radix(&job.version, 16).unwrap_or(1);
+            // cgminer/Avalon applies flip32 (full 32-byte reverse) to convert display-format
+            // prevhash from Stratum into internal block-header byte order. Match that here.
+            prev_hash.reverse();
+            let version = u32::from_str_radix(&job.version, 16).unwrap_or(1) ^ version_bits;
             let n_bits  = u32::from_str_radix(&job.n_bits, 16).unwrap_or(0);
             let n_time  = u32::from_str_radix(ntime_hex.trim_start_matches("0x"), 16).unwrap_or(0);
             let nonce   = u32::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
-            // Off-chain PoW verification
+            // Off-chain PoW verification (uses pool_scalar, same value as on-chain)
             let valid = pow::verify_share(
                 &cb1, &cb2, &en1, &en2, &branches,
                 version, &prev_hash, n_bits, n_time, nonce,
-                session.difficulty,
+                state.config.pool_scalar,
             );
 
             if !valid {
+                let (hash_hex, tgt_hex) = pow::debug_share(
+                    &cb1, &cb2, &en1, &en2, &branches,
+                    version, &prev_hash, n_bits, n_time, nonce,
+                    state.config.pool_scalar,
+                );
                 warn!(
                     worker, job_id = job_id_hex,
+                    hash = %hash_hex, target = %tgt_hex,
                     "low-difficulty share rejected"
                 );
                 send_msg(writer.clone(), &err(req.id, 23, "Low difficulty share")).await?;
@@ -384,6 +397,15 @@ async fn dispatch(
         // ── Acknowledged, not implemented in v1 ───────────────────────────────
         "mining.get_transactions" | "mining.extranonce.subscribe" => {
             send_msg(writer.clone(), &ok(req.id, serde_json::Value::Null)).await?;
+        }
+
+        "mining.configure" => {
+            // Version rolling is not supported: the on-chain submit_share has no
+            // version_bits parameter, so we cannot reconstruct the correct header.
+            // The Avalon will fall back to ntime rolling instead.
+            send_msg(writer.clone(), &ok(req.id, serde_json::json!({
+                "version-rolling": false
+            }))).await?;
         }
 
         other => {
