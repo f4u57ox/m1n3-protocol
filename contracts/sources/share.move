@@ -13,8 +13,7 @@
 /// `verify_share` is the single entry point that composes all of the above.
 /// All other functions are exposed as `public` for unit-testing and off-chain tooling.
 module m1n3_protocol::share {
-    use sui::hash::sha2_256;
-    use std::vector;
+    use std::hash::sha2_256;
 
     // ── Internal: SHA-256d ────────────────────────────────────────────────────
 

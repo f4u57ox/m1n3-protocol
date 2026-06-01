@@ -1,21 +1,21 @@
-/// Core mining pool — manages workers, active jobs, and reward distribution.
+/// Core mining pool — manages workers, active jobs, and share accounting.
 ///
 /// Every critical operation that the Stratum v1 server performs off-chain is
 /// mirrored here on Sui:
 ///
-/// • `post_job`       — operator registers a mining job template on-chain
-/// • `register_worker`— miner registers with the extranonce1 the pool assigned them
-/// • `submit_share`   — miner submits a share; contract verifies the PoW independently
-/// • `claim_reward`   — miner withdraws their proportional SUI payout, permissionlessly
+/// • `post_job`        — operator registers a Bitcoin block template on-chain
+/// • `register_worker` — miner registers with the extranonce1 the pool assigned them
+/// • `submit_share`    — miner submits a share; contract verifies the PoW independently
 ///
 /// Share verification calls `share::verify_share`, which runs real SHA-256d + difficulty
 /// comparison on-chain — no trust in the pool operator is required for attribution.
+///
+/// Bitcoin block rewards flow to an MPC address embedded in the coinbase output.
+/// On-chain share counts are the source of truth for proportional BTC distribution.
 module m1n3_protocol::pool {
     use sui::object::{Self, UID};
     use sui::tx_context::{Self, TxContext};
     use sui::transfer;
-    use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
     use sui::table::{Self, Table};
     use sui::event;
     use std::string::String;
@@ -28,8 +28,7 @@ module m1n3_protocol::pool {
     const EJobExpired:        u64 = 2;
     const EWorkerNotFound:    u64 = 3;
     const EInvalidShare:      u64 = 4;
-    const EInsufficientFunds: u64 = 5;
-    const EAlreadyRegistered: u64 = 6;
+    const EAlreadyRegistered: u64 = 5;
 
     // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -45,8 +44,6 @@ module m1n3_protocol::pool {
     public struct Pool has key {
         id:           UID,
         operator:     address,
-        /// Accumulated SUI held for reward payouts.
-        treasury:     Coin<SUI>,
         /// Active mining jobs keyed by job_id.
         jobs:         Table<u64, Job>,
         /// Registered workers keyed by their Sui address.
@@ -55,7 +52,7 @@ module m1n3_protocol::pool {
         next_job_id:  u64,
         /// Pool share difficulty scalar (applied to the job's n_bits target).
         difficulty:   u64,
-        /// Lifetime valid shares across all workers — used for proportional payouts.
+        /// Lifetime valid shares across all workers — source of truth for BTC distribution.
         total_shares: u64,
     }
 
@@ -75,8 +72,6 @@ module m1n3_protocol::pool {
         n_time:          u32,
         /// Sui epoch when this job was created — used to enforce JOB_TTL_EPOCHS.
         created_epoch:   u64,
-        /// SUI (MIST) locked in the treasury for this job's share rewards.
-        reward_pool:     u64,
     }
 
     public struct Worker has store {
@@ -86,10 +81,8 @@ module m1n3_protocol::pool {
         /// extranonce1 assigned to this worker's session at `mining.subscribe` time.
         /// Stored on-chain so `submit_share` can reconstruct the coinbase for verification.
         extranonce1:   vector<u8>,
-        /// Valid shares credited since last `claim_reward`.
+        /// Valid shares credited — proportional weight for BTC reward distribution.
         shares:        u64,
-        /// Cumulative SUI earned (MIST) across all claims.
-        earned:        u64,
         registered_at: u64,
     }
 
@@ -115,12 +108,6 @@ module m1n3_protocol::pool {
         difficulty: u64,
     }
 
-    public struct RewardPaid has copy, drop {
-        pool_id: address,
-        worker:  address,
-        amount:  u64,
-    }
-
     // ── Pool creation ─────────────────────────────────────────────────────────
 
     /// Deploy a new pool instance. The caller becomes the sole operator.
@@ -129,7 +116,6 @@ module m1n3_protocol::pool {
         let pool = Pool {
             id:           object::new(ctx),
             operator:     tx_context::sender(ctx),
-            treasury:     coin::zero<SUI>(ctx),
             jobs:         table::new(ctx),
             workers:      table::new(ctx),
             next_job_id:  0,
@@ -143,12 +129,12 @@ module m1n3_protocol::pool {
 
     // ── Operator functions ────────────────────────────────────────────────────
 
-    /// Register a new mining job on-chain. Called by the bridge in parallel with
+    /// Register a Bitcoin block template on-chain. Called by the bridge alongside
     /// the Stratum server's `mining.notify` broadcast to miners.
     ///
-    /// The operator funds the job's reward pool by providing payment. The bridge
-    /// reads these parameters from the GBT (getblocktemplate) response and the
-    /// Stratum server's current job state.
+    /// The coinbase transaction embedded in the template pays the block reward to
+    /// the pool's MPC Bitcoin address. Share counts recorded via `submit_share`
+    /// are the on-chain source of truth for proportional BTC distribution.
     public entry fun post_job(
         pool:            &mut Pool,
         prev_hash:       vector<u8>,
@@ -158,15 +144,9 @@ module m1n3_protocol::pool {
         version:         u32,
         n_bits:          u32,
         n_time:          u32,
-        reward_mist:     u64,
-        payment:         &mut Coin<SUI>,
         ctx:             &mut TxContext,
     ) {
         assert!(tx_context::sender(ctx) == pool.operator, ENotOperator);
-        assert!(coin::value(payment) >= reward_mist, EInsufficientFunds);
-
-        let fee = coin::split(payment, reward_mist, ctx);
-        coin::join(&mut pool.treasury, fee);
 
         let job_id = pool.next_job_id;
         pool.next_job_id = pool.next_job_id + 1;
@@ -184,7 +164,6 @@ module m1n3_protocol::pool {
             n_bits,
             n_time,
             created_epoch: tx_context::epoch(ctx),
-            reward_pool:   reward_mist,
         });
     }
 
@@ -219,7 +198,6 @@ module m1n3_protocol::pool {
             name,
             extranonce1,
             shares:        0,
-            earned:        0,
             registered_at: tx_context::epoch(ctx),
         });
     }
@@ -285,38 +263,10 @@ module m1n3_protocol::pool {
         });
     }
 
-    /// Withdraw the caller's proportional share of the treasury.
-    /// Resets the worker's share counter — subsequent earnings accumulate toward the next claim.
-    /// This is permissionless: no operator approval needed.
-    public entry fun claim_reward(pool: &mut Pool, ctx: &mut TxContext) {
-        let sender = tx_context::sender(ctx);
-        assert!(table::contains(&pool.workers, sender), EWorkerNotFound);
-        assert!(pool.total_shares > 0, EInvalidShare);
-
-        let worker_shares = table::borrow(&pool.workers, sender).shares;
-        assert!(worker_shares > 0, EInvalidShare);
-
-        let total  = coin::value(&pool.treasury);
-        let payout = (total as u128) * (worker_shares as u128) / (pool.total_shares as u128);
-        let payout = (payout as u64);
-
-        {
-            let worker_mut = table::borrow_mut(&mut pool.workers, sender);
-            worker_mut.shares = 0;
-            worker_mut.earned = worker_mut.earned + payout;
-        };
-
-        let reward    = coin::split(&mut pool.treasury, payout, ctx);
-        let pool_addr = object::uid_to_address(&pool.id);
-        event::emit(RewardPaid { pool_id: pool_addr, worker: sender, amount: payout });
-        transfer::public_transfer(reward, sender);
-    }
-
     // ── Read helpers ──────────────────────────────────────────────────────────
 
-    public fun difficulty(pool: &Pool): u64      { pool.difficulty }
-    public fun total_shares(pool: &Pool): u64    { pool.total_shares }
-    public fun treasury_balance(pool: &Pool): u64 { coin::value(&pool.treasury) }
+    public fun difficulty(pool: &Pool): u64   { pool.difficulty }
+    public fun total_shares(pool: &Pool): u64 { pool.total_shares }
 
     public fun worker_shares(pool: &Pool, addr: address): u64 {
         if (table::contains(&pool.workers, addr)) {
