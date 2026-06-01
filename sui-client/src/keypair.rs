@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bech32::Hrp;
 use ed25519_dalek::{Signer, SigningKey};
-use sha3::{Digest as _, Sha3_256};
+use blake2::{Blake2b, digest::{Update, FixedOutput, typenum::U32}};
 
 use crate::bcs_types::INTENT_PREFIX;
 
@@ -51,11 +51,11 @@ impl SuiKeypair {
         let signing_key   = SigningKey::from_bytes(key_bytes);
         let pubkey_bytes  = signing_key.verifying_key().to_bytes();
 
-        // Sui address = SHA3-256([flag] || pubkey)[0..32]
-        let mut h = Sha3_256::new();
-        h.update([ED25519_FLAG]);
-        h.update(pubkey_bytes);
-        let address: [u8; 32] = h.finalize().into();
+        // Sui address = BLAKE2b-256([flag] || pubkey)
+        let mut h = Blake2b::<U32>::default();
+        h.update(&[ED25519_FLAG]);
+        h.update(&pubkey_bytes);
+        let address: [u8; 32] = h.finalize_fixed().into();
 
         Ok(Self { signing_key, address })
     }
@@ -74,12 +74,16 @@ impl SuiKeypair {
     /// Sui signature format (97 bytes, then base64):
     ///   `[flag=0x00] || [ed25519_sig(64)] || [ed25519_pubkey(32)]`
     pub fn sign_transaction(&self, tx_bytes: &[u8]) -> String {
-        // Intent message: 3-byte prefix + tx_bytes
+        // Sui signing: Blake2b-256(intent_prefix || tx_bytes), then Ed25519-sign the 32-byte digest
         let mut intent_msg = Vec::with_capacity(INTENT_PREFIX.len() + tx_bytes.len());
         intent_msg.extend_from_slice(&INTENT_PREFIX);
         intent_msg.extend_from_slice(tx_bytes);
 
-        let sig     = self.signing_key.sign(&intent_msg);
+        let mut h = Blake2b::<U32>::default();
+        h.update(&intent_msg);
+        let digest = h.finalize_fixed();
+
+        let sig     = self.signing_key.sign(&digest);
         let pubkey  = self.signing_key.verifying_key().to_bytes();
 
         let mut full = Vec::with_capacity(97);

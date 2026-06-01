@@ -19,8 +19,19 @@ pub type ObjectId = [u8; 32];
 /// A monotonically increasing object version counter (u64 LE in BCS).
 pub type SequenceNumber = u64;
 
-/// An object content digest (SHA-256), 32 bytes in BCS.
-pub type ObjectDigest = [u8; 32];
+/// An object content digest (SHA-256).
+///
+/// Sui's `Digest` type uses `serde_bytes` (length-prefixed in BCS), unlike
+/// `AccountAddress` which serializes as a raw `[u8; 32]`. This newtype
+/// mirrors that: serializes via `serialize_bytes` so the full node can parse it.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectDigest(pub [u8; 32]);
+
+impl serde::Serialize for ObjectDigest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.0)
+    }
+}
 
 /// `(ObjectID, SequenceNumber, ObjectDigest)` — uniquely identifies a specific
 /// version of an owned or immutable object.
@@ -154,6 +165,7 @@ pub struct CoinData {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CoinPage {
     pub data:        Vec<CoinData>,
     pub next_cursor: Option<String>,

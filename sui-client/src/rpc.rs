@@ -94,11 +94,11 @@ impl SuiRpcClient {
     }
 
     /// Parse a coin's `(objectId, version, digest)` as an `ObjectRef` (`[u8;32], u64, [u8;32]`).
-    pub fn coin_to_object_ref(coin: &CoinData) -> Result<([u8; 32], u64, [u8; 32])> {
+    pub fn coin_to_object_ref(coin: &CoinData) -> Result<crate::bcs_types::ObjectRef> {
         let id      = parse_object_id(&coin.coin_object_id)?;
         let version = coin.version.parse::<u64>()
             .context("invalid coin version")?;
-        let digest  = parse_digest(&coin.digest)?;
+        let digest  = crate::bcs_types::ObjectDigest(parse_digest(&coin.digest)?);
         Ok((id, version, digest))
     }
 

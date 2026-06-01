@@ -91,6 +91,13 @@ impl PtbBuilder {
             .collect()
     }
 
+    /// `TransferObjects([objs], recipient_address)`.
+    pub fn transfer_objects(&mut self, objects: Vec<Argument>, recipient: [u8; 32]) {
+        use crate::bcs_types::{CallArg, Command};
+        let recipient_arg = self.add_input(CallArg::Pure(bcs::to_bytes(&recipient.to_vec()).unwrap()));
+        self.commands.push(Command::TransferObjects(objects, recipient_arg));
+    }
+
     /// `MoveCall(package, module, function, [], args)`.
     pub fn move_call(
         &mut self,
