@@ -115,6 +115,38 @@ impl SuiRpcClient {
         Ok((id, version, digest))
     }
 
+    /// Total SUI balance for `address` in MIST.
+    pub async fn get_balance(&self, address: &str) -> Result<u64> {
+        #[derive(serde::Deserialize)]
+        struct BalanceResp {
+            #[serde(rename = "totalBalance")]
+            total_balance: String,
+        }
+        let resp: BalanceResp = self.call(
+            "suix_getBalance",
+            json!([address, "0x2::sui::SUI"]),
+        ).await?;
+        resp.total_balance.parse::<u64>().context("invalid balance value")
+    }
+
+    /// Request SUI from a faucet (devnet / testnet).
+    ///
+    /// `faucet_url` — e.g. `https://faucet.devnet.sui.io/gas`
+    pub async fn request_faucet(&self, address: &str, faucet_url: &str) -> Result<()> {
+        let resp = self.client
+            .post(faucet_url)
+            .json(&json!({ "FixedAmountRequest": { "recipient": address } }))
+            .send()
+            .await
+            .context("faucet POST failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("faucet error {}: {}", status, text);
+        }
+        Ok(())
+    }
+
     /// Submit a signed programmable transaction block.
     ///
     /// `tx_b64`  — base64 BCS-encoded `TransactionData`
