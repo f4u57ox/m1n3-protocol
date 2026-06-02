@@ -210,12 +210,17 @@ module m1n3_protocol::pool {
     ///
     /// Parameters match the Stratum `mining.submit` fields:
     ///   job_id, extranonce2, ntime, nonce
+    ///
+    /// `version` is the actual block header version used when hashing — may differ
+    /// from job.version when the miner uses BIP320 version-rolling (XOR of base
+    /// version with miner-chosen bits). The sidecar computes and passes this value.
     public entry fun submit_share(
         pool:        &mut Pool,
         job_id:      u64,
         extranonce2: vector<u8>,
         n_time:      u32,
         nonce:       u32,
+        version:     u32,
         ctx:         &mut TxContext,
     ) {
         let sender = tx_context::sender(ctx);
@@ -239,7 +244,7 @@ module m1n3_protocol::pool {
             &worker.extranonce1,
             &extranonce2,
             &job.merkle_branches,
-            job.version,
+            version,
             job.prev_hash,
             job.n_bits,
             n_time,
