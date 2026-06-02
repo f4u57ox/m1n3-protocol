@@ -18,12 +18,12 @@
 
 use anyhow::Result;
 use sv1_api::json_rpc::{Message, Notification, Response, StandardRequest};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
 use crate::bitcoin_rpc::{BitcoinRpcClient, build_coinbase_parts, build_merkle_branches};
@@ -80,48 +80,20 @@ impl MinerSession {
     }
 }
 
-// ── VARDIFF share tracker ─────────────────────────────────────────────────────
-
-struct ShareTracker {
-    timestamps:      VecDeque<Instant>,
-    last_share_time: Option<Instant>,
-}
-
-impl ShareTracker {
-    fn new() -> Self { Self { timestamps: VecDeque::new(), last_share_time: None } }
-
-    fn record(&mut self) {
-        let now = Instant::now();
-        self.timestamps.push_back(now);
-        self.last_share_time = Some(now);
-    }
-
-    /// Prune entries older than `window_secs` and return (count, last_share_time).
-    fn prune_and_count(&mut self, window_secs: u64) -> (usize, Option<Instant>) {
-        let cutoff = Instant::now() - Duration::from_secs(window_secs);
-        while self.timestamps.front().map(|t| *t < cutoff).unwrap_or(false) {
-            self.timestamps.pop_front();
-        }
-        (self.timestamps.len(), self.last_share_time)
-    }
-}
-
 // ── Server ────────────────────────────────────────────────────────────────────
 
 /// Shared state cloned (via `Arc`) into every spawned connection handler.
 struct ServerState {
-    config:            BridgeConfig,
-    chain:             Arc<SuiChainClient>,
-    job_tx:            broadcast::Sender<Arc<Job>>,
-    diff_tx:           broadcast::Sender<u64>,
-    next_session:      Mutex<u32>,
+    config:       BridgeConfig,
+    chain:        Arc<SuiChainClient>,
+    job_tx:       broadcast::Sender<Arc<Job>>,
+    next_session: Mutex<u32>,
     /// Most recently broadcast job — sent to miners that subscribe mid-cycle.
-    current_job:       Mutex<Option<Arc<Job>>>,
-    /// Global VARDIFF difficulty shared across all miners.
-    global_difficulty: RwLock<u64>,
-    share_tracker:     Mutex<ShareTracker>,
-    current_nbits:     RwLock<u32>,
-    connected_miners:  Mutex<u32>,
+    current_job:  Mutex<Option<Arc<Job>>>,
+    /// History of recent jobs keyed by job_id for share validation.
+    /// Allows shares for recently-seen jobs to validate correctly even if a newer
+    /// job has been broadcast since the miner started working on that share.
+    recent_jobs:  Mutex<HashMap<u64, Arc<Job>>>,
 }
 
 pub struct StratumServer {
@@ -131,20 +103,14 @@ pub struct StratumServer {
 impl StratumServer {
     pub async fn new(config: BridgeConfig) -> Result<Self> {
         let chain = Arc::new(SuiChainClient::new(config.clone())?);
-        let (job_tx, _)  = broadcast::channel(32);
-        let (diff_tx, _) = broadcast::channel(64);
-        let initial_diff = config.initial_difficulty;
+        let (job_tx, _) = broadcast::channel(32);
         Ok(Self {
             state: Arc::new(ServerState {
                 chain,
                 job_tx,
-                diff_tx,
-                next_session:      Mutex::new(0),
-                current_job:       Mutex::new(None),
-                global_difficulty: RwLock::new(initial_diff),
-                share_tracker:     Mutex::new(ShareTracker::new()),
-                current_nbits:     RwLock::new(0),
-                connected_miners:  Mutex::new(0),
+                next_session: Mutex::new(0),
+                current_job:  Mutex::new(None),
+                recent_jobs:  Mutex::new(HashMap::new()),
                 config,
             }),
         })
@@ -154,12 +120,6 @@ impl StratumServer {
         let addr = format!("{}:{}", self.state.config.host, self.state.config.port);
         let listener = TcpListener::bind(&addr).await?;
         info!("Stratum v1 server listening on {}", addr);
-
-        // ── VARDIFF loop ──────────────────────────────────────────────────────
-        {
-            let state = self.state.clone();
-            tokio::spawn(async move { global_vardiff_loop(state).await; });
-        }
 
         // ── Job refresh loop ──────────────────────────────────────────────────
         // Polls Bitcoin Core for new block templates and broadcasts to miners.
@@ -171,7 +131,7 @@ impl StratumServer {
                 state.config.bitcoin_rpc_pass.clone(),
             );
             let interval = Duration::from_secs(state.config.job_refresh_secs);
-            let mut job_counter: u64 = 0;
+            let mut first_job = true;
 
             tokio::spawn(async move {
                 loop {
@@ -181,14 +141,32 @@ impl StratumServer {
                         }
                         Ok(tmpl) => {
                             let n_bits = u32::from_str_radix(&tmpl.bits, 16).unwrap_or(0);
-                            *state.current_nbits.write().await = n_bits;
 
                             let (cb1, cb2) = build_coinbase_parts(&tmpl, 4, 4);
-                            job_counter = job_counter.wrapping_add(1);
+                            // Fetch the on-chain next_job_id so stratum job IDs always
+                            // match what the contract auto-assigns on post_job.
+                            let job_counter = match state.chain.get_next_job_id().await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    error!(error = %e, "get_next_job_id failed — skipping job");
+                                    tokio::time::sleep(interval).await;
+                                    continue;
+                                }
+                            };
+
+                            // Stratum prevhash convention: per-word-swap of internal
+                            // (internal = full-reverse of Bitcoin RPC display format).
+                            // CGMiner/Avalon applies per-word-swap to the received bytes
+                            // to get back internal for the block header.
+                            let stratum_prev_hash = {
+                                let mut b = hex::decode(&tmpl.previousblockhash).unwrap_or_default();
+                                b.reverse(); // display → internal
+                                b.chunks(4).flat_map(|c| c.iter().rev().copied()).collect::<Vec<u8>>()
+                            };
 
                             let job = Arc::new(Job {
                                 id:              job_counter,
-                                prev_hash:       tmpl.previousblockhash.clone(),
+                                prev_hash:       hex::encode(&stratum_prev_hash),
                                 coinbase1:       cb1,
                                 coinbase2:       cb2,
                                 merkle_branches: build_merkle_branches(&tmpl.transactions)
@@ -207,18 +185,28 @@ impl StratumServer {
                                 "new job from getblocktemplate"
                             );
 
-                            // First job: init on-chain difficulty inline (sequential with
-                            // post_job spawn below) to avoid gas coin lock conflict.
-                            if job_counter == 1 {
-                                let init_diff = *state.global_difficulty.read().await;
+                            // First job: set on-chain pool difficulty from INITIAL_DIFFICULTY.
+                            if first_job {
+                                first_job = false;
                                 if let Err(e) = state.chain.init_pool_difficulty(n_bits).await {
                                     error!(error = %e, "init_pool_difficulty failed");
                                 }
-                                let _ = state.diff_tx.send(init_diff);
                             }
 
                             // Store as current job for late-connecting miners
                             *state.current_job.lock().await = Some(job.clone());
+
+                            // Keep a rolling window of recent jobs for share validation.
+                            // Miners may submit shares for jobs slightly older than current.
+                            {
+                                let mut jobs = state.recent_jobs.lock().await;
+                                jobs.insert(job.id, job.clone());
+                                if jobs.len() > 20 {
+                                    if let Some(&oldest) = jobs.keys().min() {
+                                        jobs.remove(&oldest);
+                                    }
+                                }
+                            }
 
                             // Broadcast to all connected miners
                             let _ = state.job_tx.send(job.clone());
@@ -227,8 +215,18 @@ impl StratumServer {
                             let chain = state.chain.clone();
                             let j     = job.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = chain.post_job(&j).await {
-                                    error!(job_id = j.id, error = %e, "post_job PTB failed");
+                                match chain.post_job(&j).await {
+                                    Ok((digest, on_chain_id)) => {
+                                        if on_chain_id != j.id {
+                                            warn!(
+                                                stratum_id = j.id,
+                                                on_chain_id,
+                                                digest = %digest,
+                                                "job ID mismatch between stratum and chain"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => error!(job_id = j.id, error = %e, "post_job PTB failed"),
                                 }
                             });
                         }
@@ -255,11 +253,7 @@ impl StratumServer {
 // ── Connection handler ────────────────────────────────────────────────────────
 
 async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    *state.connected_miners.lock().await += 1;
-    let result = handle_connection_inner(stream, state.clone()).await;
-    let mut count = state.connected_miners.lock().await;
-    *count = count.saturating_sub(1);
-    result
+    handle_connection_inner(stream, state).await
 }
 
 async fn handle_connection_inner(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
@@ -274,16 +268,14 @@ async fn handle_connection_inner(stream: TcpStream, state: Arc<ServerState>) -> 
         *n += 1;
         s
     };
-    let initial_diff = *state.global_difficulty.read().await;
     let mut session = MinerSession::new(
         extranonce1.clone(),
         extranonce1,
-        initial_diff,
+        state.config.initial_difficulty,
     );
 
-    let mut job_rx  = state.job_tx.subscribe();
-    let mut diff_rx = state.diff_tx.subscribe();
-    let mut line    = String::new();
+    let mut job_rx = state.job_tx.subscribe();
+    let mut line   = String::new();
 
     loop {
         line.clear();
@@ -310,15 +302,6 @@ async fn handle_connection_inner(stream: TcpStream, state: Arc<ServerState>) -> 
                     let notif = Notification {
                         method: "mining.notify".to_string(),
                         params: job.to_notify_params(),
-                    };
-                    send_msg(writer.clone(), &Message::Notification(notif)).await?;
-                }
-            }
-            Ok(new_diff) = diff_rx.recv() => {
-                if session.authorized {
-                    let notif = Notification {
-                        method: "mining.set_difficulty".to_string(),
-                        params: serde_json::json!([new_diff]),
                     };
                     send_msg(writer.clone(), &Message::Notification(notif)).await?;
                 }
@@ -398,10 +381,15 @@ async fn dispatch(
                 .unwrap_or(0);
             let worker       = session.username.as_deref().unwrap_or("unknown");
 
-            // Resolve current job for verification
-            let job_opt = state.current_job.lock().await.clone();
+            // Look up the specific job the miner submitted against.
+            // Using the submitted job_id (not state.current_job) is critical for
+            // correctness: the ASIC may submit shares for jobs that were valid when
+            // it received them but are no longer the latest job.
+            let job_id_dec = u64::from_str_radix(job_id_hex, 16).unwrap_or(0);
+            let job_opt = state.recent_jobs.lock().await.get(&job_id_dec).cloned();
             let Some(job) = job_opt else {
-                send_msg(writer.clone(), &err(req.id, 21, "No active job")).await?;
+                warn!(worker, job_id = job_id_hex, "share rejected — job not in recent history");
+                send_msg(writer.clone(), &err(req.id, 21, "Job not found")).await?;
                 return Ok(());
             };
 
@@ -427,22 +415,25 @@ async fn dispatch(
                     hex::decode(b).ok().and_then(|v| v.try_into().ok())
                 })
                 .collect();
+            // job.prev_hash is in Stratum format: per_word_swap(internal).
+            // CGMiner applies per_word_swap to the received Stratum bytes to get internal.
+            // Apply the same per-word-swap here so both sides hash the same header.
             let mut prev_hash: [u8; 32] = hex::decode(&job.prev_hash)
                 .unwrap_or_default()
                 .try_into()
                 .unwrap_or([0u8; 32]);
-            // cgminer/Avalon applies flip32 (full 32-byte reverse) to convert display-format
-            // prevhash from Stratum into internal block-header byte order. Match that here.
-            prev_hash.reverse();
+            for chunk in prev_hash.chunks_mut(4) {
+                chunk.reverse(); // per-word-swap → internal byte order
+            }
             let version = u32::from_str_radix(&job.version, 16).unwrap_or(1) ^ version_bits;
             let n_bits  = u32::from_str_radix(&job.n_bits, 16).unwrap_or(0);
             let n_time  = u32::from_str_radix(ntime_hex.trim_start_matches("0x"), 16).unwrap_or(0);
             let nonce   = u32::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
-            // Off-chain PoW check using live VARDIFF pool_scalar
+            // Off-chain PoW check: scalar derived from the fixed minimum difficulty.
             let pool_scalar = pow::compute_pool_scalar(
-                *state.current_nbits.read().await,
-                *state.global_difficulty.read().await,
+                n_bits,
+                state.config.initial_difficulty,
             );
             let valid = pow::verify_share(
                 &cb1, &cb2, &en1, &en2, &branches,
@@ -465,7 +456,6 @@ async fn dispatch(
                 return Ok(());
             }
 
-            state.share_tracker.lock().await.record();
             info!(
                 worker,
                 job_id      = job_id_hex,
@@ -497,66 +487,6 @@ async fn dispatch(
         }
     }
     Ok(())
-}
-
-// ── Global VARDIFF ────────────────────────────────────────────────────────────
-
-/// P2Pool-style global difficulty adjustment shared across all miners.
-///
-/// Every 5 seconds, measures the share rate over a 120-second sliding window.
-/// Adjusts by at most 2× per tick; never drops below `initial_difficulty`.
-/// Broadcasts the new difficulty to all miners via `diff_tx`.
-async fn global_vardiff_loop(state: Arc<ServerState>) {
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        let n_bits = *state.current_nbits.read().await;
-        if n_bits == 0 { continue; } // no block template yet
-
-        let current_diff = *state.global_difficulty.read().await;
-        let connected    = *state.connected_miners.lock().await;
-        let initial      = state.config.initial_difficulty;
-        let target_spm   = state.config.target_shares_per_min;
-
-        let (share_count, last_share) = state.share_tracker.lock().await.prune_and_count(120);
-
-        let drought = share_count < 4
-            && connected > 0
-            && last_share
-                .map(|t| t.elapsed() > Duration::from_secs(120))
-                .unwrap_or(true);
-
-        let new_diff = if drought {
-            (current_diff / 2).max(initial)
-        } else if share_count == 0 {
-            current_diff
-        } else {
-            let actual_rate = share_count as f64 / 120.0;
-            let target_rate = target_spm as f64 / 60.0;
-            let ratio       = (actual_rate / target_rate).clamp(0.5, 2.0);
-            if (0.67..=1.5).contains(&ratio) {
-                current_diff // dead zone — no change
-            } else {
-                ((current_diff as f64 * ratio) as u64).max(initial)
-            }
-        };
-
-        if new_diff != current_diff {
-            *state.global_difficulty.write().await = new_diff;
-            info!(old = current_diff, new = new_diff, "Global vardiff adjustment");
-            let _ = state.diff_tx.send(new_diff);
-
-            let chain = state.chain.clone();
-            let nb    = n_bits;
-            let nd    = new_diff;
-            tokio::spawn(async move {
-                if let Err(e) = chain.update_on_chain_difficulty(nb, nd).await {
-                    error!(error = %e, "update_on_chain_difficulty failed");
-                }
-            });
-        }
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

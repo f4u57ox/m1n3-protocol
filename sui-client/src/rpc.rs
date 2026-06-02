@@ -84,6 +84,19 @@ impl SuiRpcClient {
         resp.data.context("object not found")
     }
 
+    /// Fetch a Sui object with both owner and content fields.
+    /// Returns the raw `data` value so callers can parse arbitrary fields.
+    pub async fn get_object_with_content(&self, object_id: &str) -> Result<serde_json::Value> {
+        let resp: serde_json::Value = self.call(
+            "sui_getObject",
+            json!([object_id, {"showOwner": true, "showContent": true}]),
+        ).await?;
+        if let Some(err) = resp.get("error").filter(|v| !v.is_null()) {
+            anyhow::bail!("sui_getObject error: {}", err);
+        }
+        Ok(resp)
+    }
+
     /// Extract `initial_shared_version` from an object's owner field.
     pub fn parse_shared_version(owner: &serde_json::Value) -> Result<u64> {
         owner

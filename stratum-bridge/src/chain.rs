@@ -27,10 +27,8 @@ pub struct BridgeConfig {
     pub pool_object_id:   String,
     /// Deployed package ID from `sui client publish`.
     pub package_id:       String,
-    /// Stratum difficulty floor — miners never go below this (VARDIFF floor).
+    /// Fixed minimum difficulty sent to miners via `mining.set_difficulty`.
     pub initial_difficulty: u64,
-    /// VARDIFF target: how many shares per minute across all miners.
-    pub target_shares_per_min: u64,
     // ── Bitcoin Core RPC ─────────────────────────────────────────────────────
     pub bitcoin_rpc_url:  String,
     pub bitcoin_rpc_user: String,
@@ -59,10 +57,6 @@ impl BridgeConfig {
                 .unwrap_or_else(|_| "512".to_string())
                 .parse()
                 .context("INITIAL_DIFFICULTY must be a u64")?,
-            target_shares_per_min: std::env::var("TARGET_SHARES_PER_MIN")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .context("TARGET_SHARES_PER_MIN must be a u64")?,
             bitcoin_rpc_url: std::env::var("BITCOIN_RPC_URL")
                 .context("BITCOIN_RPC_URL is required (e.g. http://127.0.0.1:8332)")?,
             bitcoin_rpc_user: std::env::var("BITCOIN_RPC_USER")
@@ -105,19 +99,35 @@ impl SuiChainClient {
         Ok(Self { config, rpc, keypair, package_id, pool_id })
     }
 
+    /// Read the pool's current `next_job_id` — the ID that will be auto-assigned
+    /// to the next `post_job` call.  Used to keep stratum job IDs in sync with
+    /// the on-chain counter before broadcasting to miners.
+    pub async fn get_next_job_id(&self) -> Result<u64> {
+        let pool_json = self.rpc.get_object_with_content(&self.config.pool_object_id).await?;
+        pool_json
+            .pointer("/data/content/fields/next_job_id")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .context("next_job_id not found in pool object")
+    }
+
     /// Post a new mining job template on-chain via `pool::post_job`.
     ///
-    /// Builds, signs, and submits a Sui PTB. Returns the transaction digest.
-    pub async fn post_job(&self, job: &Job) -> Result<String> {
+    /// Returns `(digest, on_chain_job_id)` — the on-chain ID is read from
+    /// `pool.next_job_id` before submission, guaranteeing it matches the ID
+    /// the contract will auto-assign.
+    pub async fn post_job(&self, job: &Job) -> Result<(String, u64)> {
         debug!(job_id = job.id, n_bits = %job.n_bits, "building post_job PTB");
 
         // ── Decode hex fields from the Job struct ─────────────────────────────
-        // GBT previousblockhash is in display (big-endian) byte order.
-        // The block header and the off-chain PoW check both use internal
-        // (little-endian) byte order, so reverse to match.
-        let mut prev_hash_bytes = hex::decode(&job.prev_hash)
-            .context("invalid prev_hash hex")?;
-        prev_hash_bytes.reverse();
+        // job.prev_hash is in Stratum format: per-word-swapped internal byte order
+        // (pool.rs applies display→internal→word_swap before broadcasting).
+        // Undo the word-swap (apply it again) to recover internal byte order,
+        // which is what share.move::pack_header expects.
+        let prev_hash_bytes: Vec<u8> = hex::decode(&job.prev_hash)
+            .context("invalid prev_hash hex")?
+            .chunks(4)
+            .flat_map(|c| c.iter().rev().copied())
+            .collect();
         let cb1_bytes = hex::decode(&job.coinbase1)
             .context("invalid coinbase1 hex")?;
         let cb2_bytes = hex::decode(&job.coinbase2)
@@ -136,10 +146,16 @@ impl SuiChainClient {
         // ── Fetch on-chain state ──────────────────────────────────────────────
         let sender = self.keypair.address;
 
-        let pool_obj = self.rpc.get_object(&self.config.pool_object_id).await?;
-        let initial_shared_version = SuiRpcClient::parse_shared_version(
-            pool_obj.owner.as_ref().context("pool object has no owner field")?,
-        )?;
+        // Fetch pool with content so we can read next_job_id before submitting.
+        let pool_json = self.rpc.get_object_with_content(&self.config.pool_object_id).await?;
+        let on_chain_job_id: u64 = pool_json
+            .pointer("/data/content/fields/next_job_id")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0);
+        let initial_shared_version = pool_json
+            .pointer("/data/owner/Shared/initial_shared_version")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .context("pool object missing shared version")?;
 
         let gas_coin  = self.rpc.get_first_coin(&self.keypair.address_hex()).await?;
         let gas_ref   = SuiRpcClient::coin_to_object_ref(&gas_coin)?;
@@ -176,8 +192,8 @@ impl SuiChainClient {
         );
 
         let digest = self.rpc.execute_transaction(&tx_b64, &sig_b64).await?;
-        info!(job_id = job.id, digest = %digest, "job posted on-chain");
-        Ok(digest)
+        info!(job_id = on_chain_job_id, digest = %digest, "job posted on-chain");
+        Ok((digest, on_chain_job_id))
     }
 
     /// Set the on-chain pool difficulty derived from the current n_bits and initial_difficulty.
@@ -190,19 +206,6 @@ impl SuiChainClient {
             n_bits     = format!("{:08x}", n_bits),
             pool_scalar,
             "on-chain pool difficulty initialized"
-        );
-        Ok(())
-    }
-
-    /// Update on-chain difficulty after a VARDIFF adjustment.
-    pub async fn update_on_chain_difficulty(&self, n_bits: u32, new_diff: u64) -> Result<()> {
-        let pool_scalar = compute_pool_scalar(n_bits, new_diff);
-        self.set_on_chain_difficulty(pool_scalar).await?;
-        info!(
-            n_bits     = format!("{:08x}", n_bits),
-            stratum_diff = new_diff,
-            pool_scalar,
-            "on-chain difficulty updated via VARDIFF"
         );
         Ok(())
     }
