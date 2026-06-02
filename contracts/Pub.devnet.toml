@@ -7,9 +7,9 @@ chain-id = "f91cee94"
 
 [[published]]
 source = { local = "/Users/f4u57/Desktop/m1n3-protocol/contracts" }
-published-at = "0xbb41d6395d38bdb8d7a2999236d6ced544fd4f63c7eb547575001afe236a2c5a"
-original-id = "0xbb41d6395d38bdb8d7a2999236d6ced544fd4f63c7eb547575001afe236a2c5a"
+published-at = "0x7b5fb984726948175f9cf35aa9e950cd944c7b0cf3170f2929bc4faa15f5bd5e"
+original-id = "0x7b5fb984726948175f9cf35aa9e950cd944c7b0cf3170f2929bc4faa15f5bd5e"
 version = 1
 toolchain-version = "1.68.0"
 build-config = { flavor = "sui", edition = "2024" }
-upgrade-capability = "0x43f605f42c1d8b132fe90982142d0e9dfa6db738b931bc475429cfb2bd693688"
+upgrade-capability = "0x0a0c2fb0d766ca38256333d1052b97682c891221496cd1a962844bc7981f765f"

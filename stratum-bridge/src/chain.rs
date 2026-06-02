@@ -13,7 +13,6 @@ use sui_client::{
 };
 
 use crate::pool::Job;
-use crate::pow::compute_pool_scalar;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -196,17 +195,13 @@ impl SuiChainClient {
         Ok((digest, on_chain_job_id))
     }
 
-    /// Set the on-chain pool difficulty derived from the current n_bits and initial_difficulty.
+    /// Set the on-chain pool Stratum difficulty from INITIAL_DIFFICULTY.
     ///
     /// Called once when the first block template arrives.
-    pub async fn init_pool_difficulty(&self, n_bits: u32) -> Result<()> {
-        let pool_scalar = compute_pool_scalar(n_bits, self.config.initial_difficulty);
-        self.set_on_chain_difficulty(pool_scalar).await?;
-        info!(
-            n_bits     = format!("{:08x}", n_bits),
-            pool_scalar,
-            "on-chain pool difficulty initialized"
-        );
+    pub async fn init_pool_difficulty(&self, _n_bits: u32) -> Result<()> {
+        let stratum_diff = self.config.initial_difficulty;
+        self.set_on_chain_difficulty(stratum_diff).await?;
+        info!(stratum_diff, "on-chain pool difficulty initialized");
         Ok(())
     }
 

@@ -101,6 +101,81 @@ module m1n3_protocol::share {
 
     // ── Difficulty ────────────────────────────────────────────────────────────
 
+    /// The Bitcoin difficulty-1 target: nbits_to_target(0x1d00ffff).
+    /// 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    /// Pool share target = diff1_target / stratum_difficulty.
+    fun diff1_target(): vector<u8> {
+        nbits_to_target(0x1d00ffff)
+    }
+
+    /// Divide a 32-byte big-endian 256-bit target by a u64 scalar.
+    ///
+    /// Implements long division byte-by-byte (MSB to LSB).  The invariant
+    /// remainder < scalar guarantees quotient ≤ 255 per step, so each output
+    /// byte is always in range [0, 255].
+    fun divide_target_by_scalar(target: vector<u8>, scalar: u64): vector<u8> {
+        let scalar128 = (scalar as u128);
+        let mut result = vector::empty<u8>();
+        let mut remainder: u128 = 0;
+        let mut i = 0u64;
+        while (i < 32) {
+            remainder = remainder * 256 + (*vector::borrow(&target, i) as u128);
+            let quotient = remainder / scalar128;
+            remainder = remainder % scalar128;
+            vector::push_back(&mut result, (quotient as u8));
+            i = i + 1;
+        };
+        result
+    }
+
+    /// Compute the actual Stratum difficulty of a share from its block hash.
+    ///
+    ///   share_difficulty = 0xFFFF × 2^exp / hash_mantissa_64bit
+    ///
+    /// where hash_mantissa_64bit is the 8 most-significant bytes of the hash in
+    /// big-endian (display) order, and exp = 208 − 8 × lsb_position.
+    ///
+    /// Mirrors calculate_difficulty_from_hash() in the m1n3_sui reference server.
+    /// Uses 64-bit mantissa precision — gives distinct values for every share.
+    /// Saturates to 0xFFFFFFFFFFFFFFFF on near-block difficulty overflow.
+    ///
+    /// `hash` is in internal (little-endian) Bitcoin byte order — hash[31] is
+    /// the most-significant display byte.
+    fun compute_share_difficulty(hash: &vector<u8>): u64 {
+        // Find the highest non-zero byte (scan from the most-significant end).
+        // In internal byte order, high indices = high significance.
+        let mut msb = 31u64;
+        while (msb > 0 && *vector::borrow(hash, msb) == 0) {
+            msb = msb - 1;
+        };
+        if (*vector::borrow(hash, msb) == 0) return 0xFFFFFFFFFFFFFFFF;
+
+        // Build 64-bit mantissa from up to 8 bytes starting at msb, going down.
+        let bytes = if (msb + 1 < 8) { msb + 1 } else { 8u64 };
+        let mut mant: u64 = 0;
+        let mut i = 0u64;
+        while (i < bytes) {
+            mant = (mant << 8) | (*vector::borrow(hash, msb - i) as u64);
+            i = i + 1;
+        };
+        if (mant == 0) return 0xFFFFFFFFFFFFFFFF;
+
+        // lsb = position of the least-significant byte of the 8-byte window.
+        // exp = 208 - 8 × lsb  (always ≥ 16 for valid Bitcoin shares; max 208)
+        let lsb = msb - bytes + 1;
+        if (lsb * 8 > 208) return 1; // hash > diff1: invalid, floor to 1
+        let exp = 208 - lsb * 8;
+
+        if (exp >= 112) {
+            return 0xFFFFFFFFFFFFFFFF // near-block: saturate
+        };
+
+        // diff = (0xFFFF × 2^exp) / mant, computed in u128 to avoid overflow.
+        let numerator: u128 = 65535u128 << (exp as u8);
+        let result = numerator / (mant as u128);
+        if (result > 0xFFFFFFFFFFFFFFFFu128) { 0xFFFFFFFFFFFFFFFF } else { (result as u64) }
+    }
+
     /// Decode Bitcoin's compact n_bits encoding into a 32-byte big-endian target.
     ///
     /// Layout of n_bits (u32, big-endian interpretation):
@@ -195,31 +270,33 @@ module m1n3_protocol::share {
 
     /// Verify a complete Stratum v1 share submission.
     ///
-    /// Returns true only if the reconstructed block hash meets the pool share difficulty
-    /// target (network n_bits target scaled up by the pool's difficulty_scalar).
+    /// Returns `(is_valid, actual_difficulty)` where `actual_difficulty` is the
+    /// specific difficulty of this share: diff1_target / block_hash_value.
+    /// This value varies per share — a share can be much harder than the pool minimum.
     ///
-    /// Parameters mirror the fields in a Stratum `mining.submit` message plus the
-    /// job template registered on-chain via `pool::post_job`.
+    /// Pool acceptance threshold: hash ≤ diff1_target / stratum_difficulty.
     public fun verify_share(
-        coinbase1:        &vector<u8>,
-        coinbase2:        &vector<u8>,
-        extranonce1:      &vector<u8>,
-        extranonce2:      &vector<u8>,
-        merkle_branches:  &vector<vector<u8>>,
-        version:          u32,
-        prev_hash:        vector<u8>,
-        n_bits:           u32,
-        n_time:           u32,
-        nonce:            u32,
-        difficulty_scalar: u64,
-    ): bool {
+        coinbase1:         &vector<u8>,
+        coinbase2:         &vector<u8>,
+        extranonce1:       &vector<u8>,
+        extranonce2:       &vector<u8>,
+        merkle_branches:   &vector<vector<u8>>,
+        version:           u32,
+        prev_hash:         vector<u8>,
+        n_bits:            u32,
+        n_time:            u32,
+        nonce:             u32,
+        stratum_difficulty: u64,
+    ): (bool, u64) {
         let cb_hash  = coinbase_hash(coinbase1, extranonce1, extranonce2, coinbase2);
         let merkle   = compute_merkle_root(cb_hash, merkle_branches);
         let header   = pack_header(version, prev_hash, merkle, n_time, n_bits, nonce);
         let hash     = block_hash(header);
-        let net_tgt  = nbits_to_target(n_bits);
-        let pool_tgt = scale_target(net_tgt, difficulty_scalar);
-        meets_target(hash, pool_tgt)
+        // Compute actual share difficulty before moving hash into meets_target.
+        let actual_diff = compute_share_difficulty(&hash);
+        let pool_tgt = divide_target_by_scalar(diff1_target(), stratum_difficulty);
+        let is_valid = meets_target(hash, pool_tgt);
+        (is_valid, actual_diff)
     }
 
     // ── Serialization helpers ─────────────────────────────────────────────────

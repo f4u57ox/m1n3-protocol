@@ -32,9 +32,8 @@ module m1n3_protocol::pool {
 
     // ── Constants ─────────────────────────────────────────────────────────────
 
-    /// Default pool share difficulty scalar (pool target = network target × scalar).
-    /// Higher scalar → easier shares → more frequent submissions.
-    const DEFAULT_DIFFICULTY: u64 = 1_000;
+    /// Default pool Stratum difficulty (pool target = diff1_target / difficulty).
+    const DEFAULT_DIFFICULTY: u64 = 512;
 
     /// Jobs expire after this many Sui epochs (~24 h each on mainnet).
     const JOB_TTL_EPOCHS: u64 = 2;
@@ -50,7 +49,7 @@ module m1n3_protocol::pool {
         workers:      Table<address, Worker>,
         /// Monotonically increasing job counter.
         next_job_id:  u64,
-        /// Pool share difficulty scalar (applied to the job's n_bits target).
+        /// Pool share Stratum difficulty (pool target = diff1_target / difficulty).
         difficulty:   u64,
         /// Lifetime valid shares across all workers — source of truth for BTC distribution.
         total_shares: u64,
@@ -167,8 +166,7 @@ module m1n3_protocol::pool {
         });
     }
 
-    /// Update the pool share difficulty scalar. The bridge calls this when VARDIFF
-    /// adjusts the per-worker difficulty in the Stratum server.
+    /// Update the pool Stratum difficulty. The bridge calls this once on startup.
     public entry fun set_difficulty(
         pool:           &mut Pool,
         new_difficulty: u64,
@@ -238,7 +236,7 @@ module m1n3_protocol::pool {
         // Reconstruct the block hash from the share fields and check it meets
         // the pool's share difficulty target. This is identical to what the
         // traditional Stratum server does off-chain.
-        let valid = share::verify_share(
+        let (valid, actual_diff) = share::verify_share(
             &job.coinbase1,
             &job.coinbase2,
             &worker.extranonce1,
@@ -264,7 +262,7 @@ module m1n3_protocol::pool {
             job_id,
             worker:     sender,
             nonce,
-            difficulty: pool.difficulty,
+            difficulty: actual_diff,
         });
     }
 
