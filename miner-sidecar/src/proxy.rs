@@ -57,6 +57,8 @@ struct PendingSubmit {
     extranonce2: String,
     ntime:       String,
     nonce:       String,
+    /// BIP320 version bits XOR'd with job.version; 0 if not using version-rolling.
+    version_bits: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,23 @@ async fn handle_session(
 
                 if let Ok(Message::StandardRequest(req)) = serde_json::from_str::<Message>(&line) {
                     match req.method.as_str() {
+                        "mining.configure" => {
+                            // Intercept and answer locally: accept version-rolling with
+                            // the standard BIP320 mask so the ASIC stays connected.
+                            // The actual version bits are handled per-share in the sidecar.
+                            let resp = serde_json::json!({
+                                "id": req.id,
+                                "error": null,
+                                "result": {
+                                    "version-rolling": true,
+                                    "version-rolling.mask": "1fffe000"
+                                }
+                            });
+                            let mut w = ds_writer.lock().await;
+                            w.write_all(resp.to_string().as_bytes()).await?;
+                            w.write_all(b"\n").await?;
+                            continue; // do not forward to pool
+                        }
                         "mining.submit" => {
                             intercept_miner_submit(&req.params, req.id, &state).await;
                         }
@@ -217,11 +236,16 @@ async fn intercept_miner_submit(
     let ntime       = arr[3].as_str().unwrap_or("0").to_string();
     let nonce       = arr[4].as_str().unwrap_or("0").to_string();
     let job_id      = u64::from_str_radix(job_id_hex, 16).unwrap_or(0);
+    // BIP320 version bits (present when miner uses version-rolling).
+    let version_bits = arr.get(5)
+        .and_then(|v| v.as_str())
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
 
-    debug!(job_id, nonce = %nonce, "buffering pending share");
+    debug!(job_id, nonce = %nonce, version_bits, "buffering pending share");
 
     let mut s = state.lock().await;
-    s.pending_submit = Some(PendingSubmit { job_id, extranonce2, ntime, nonce });
+    s.pending_submit = Some(PendingSubmit { job_id, extranonce2, ntime, nonce, version_bits });
     s.pending_rpc_id = Some(rpc_id);
 }
 
@@ -290,6 +314,12 @@ async fn intercept_pool_message(
                                 digest = %digest,
                                 "worker registered on-chain"
                             ),
+                            // EAlreadyRegistered (error code 5): worker entry already
+                            // exists in the pool — safe to continue submitting shares.
+                            Err(e) if e.to_string().contains(", 5)") => info!(
+                                worker = %username,
+                                "worker already registered, continuing"
+                            ),
                             Err(e) => error!(
                                 worker = %username,
                                 error  = %e,
@@ -304,6 +334,13 @@ async fn intercept_pool_message(
             // ── submit accepted → submit share on-chain ───────────────────────
             let pending_id = s.pending_rpc_id;
             if Some(resp.id) == pending_id {
+                if resp.result.as_bool() != Some(true) {
+                    // Pool rejected (result=null/false) but sv1_api parsed as OkResponse.
+                    s.pending_submit = None;
+                    s.pending_rpc_id = None;
+                    debug!("share result={} — not submitted on-chain", resp.result);
+                    return;
+                }
                 let pending = s.pending_submit.take();
                 s.pending_rpc_id = None;
                 drop(s); // release lock before spawning
@@ -316,8 +353,17 @@ async fn intercept_pool_message(
                     let nonce = u32::from_str_radix(
                         p.nonce.trim_start_matches("0x"), 16
                     ).unwrap_or(0);
+                    // Compute the actual block header version (BIP320 version-rolling).
+                    // base_version from the job template, XOR'd with the miner's bits.
+                    let base_version = {
+                        let s = state.lock().await;
+                        s.current_job.as_ref()
+                            .and_then(|j| u32::from_str_radix(&j.version, 16).ok())
+                            .unwrap_or(0x20000000)
+                    };
+                    let version = (base_version & !0x1fffe000) | (p.version_bits & 0x1fffe000);
 
-                    let share = PendingShare { job_id: p.job_id, extranonce2, n_time, nonce };
+                    let share = PendingShare { job_id: p.job_id, extranonce2, n_time, nonce, version };
                     let sub   = submitter.clone();
                     tokio::spawn(async move {
                         match sub.submit_share(&share).await {

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use sui_client::{
@@ -23,16 +24,21 @@ pub struct PendingShare {
     pub extranonce2: Vec<u8>,
     pub n_time:      u32,
     pub nonce:       u32,
+    /// Actual block header version used for hashing (base version XOR version_bits
+    /// when the miner uses BIP320 version-rolling).
+    pub version:     u32,
 }
 
 // ── ChainSubmitter ────────────────────────────────────────────────────────────
 
 pub struct ChainSubmitter {
-    config:     SidecarConfig,
-    rpc:        SuiRpcClient,
-    keypair:    SuiKeypair,
-    package_id: [u8; 32],
-    pool_id:    [u8; 32],
+    config:      SidecarConfig,
+    rpc:         SuiRpcClient,
+    keypair:     SuiKeypair,
+    package_id:  [u8; 32],
+    pool_id:     [u8; 32],
+    /// Serializes PTB submissions so concurrent shares don't race for the same gas coin.
+    submit_lock: Mutex<()>,
 }
 
 impl ChainSubmitter {
@@ -50,10 +56,14 @@ impl ChainSubmitter {
             "sidecar chain submitter initialized"
         );
 
-        Ok(Self { config, rpc, keypair, package_id, pool_id })
+        Ok(Self { config, rpc, keypair, package_id, pool_id, submit_lock: Mutex::new(()) })
     }
 
     async fn execute_ptb(&self, ptb: PtbBuilder) -> Result<String> {
+        // Hold the lock for the full gas-fetch → sign → submit sequence so that
+        // concurrent share submissions don't try to use the same gas coin object.
+        let _guard = self.submit_lock.lock().await;
+
         let sender    = self.keypair.address;
         let gas_coin  = self.rpc.get_first_coin(&self.keypair.address_hex()).await?;
         let gas_ref   = SuiRpcClient::coin_to_object_ref(&gas_coin)?;
@@ -85,15 +95,16 @@ impl ChainSubmitter {
         let initial_shared_version = self.pool_shared_version().await?;
 
         let mut ptb = PtbBuilder::new();
-        let pool_arg   = ptb.shared_object(self.pool_id, initial_shared_version, true);
-        let job_id_arg = ptb.pure_u64(share.job_id)?;
-        let en2_arg    = ptb.pure_bytes(share.extranonce2.clone())?;
-        let ntime_arg  = ptb.pure_u32(share.n_time)?;
-        let nonce_arg  = ptb.pure_u32(share.nonce)?;
+        let pool_arg    = ptb.shared_object(self.pool_id, initial_shared_version, true);
+        let job_id_arg  = ptb.pure_u64(share.job_id)?;
+        let en2_arg     = ptb.pure_bytes(share.extranonce2.clone())?;
+        let ntime_arg   = ptb.pure_u32(share.n_time)?;
+        let nonce_arg   = ptb.pure_u32(share.nonce)?;
+        let version_arg = ptb.pure_u32(share.version)?;
 
         ptb.move_call(
             self.package_id, "pool", "submit_share",
-            vec![pool_arg, job_id_arg, en2_arg, ntime_arg, nonce_arg],
+            vec![pool_arg, job_id_arg, en2_arg, ntime_arg, nonce_arg, version_arg],
         );
 
         let digest = self.execute_ptb(ptb).await?;
