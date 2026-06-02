@@ -8,7 +8,8 @@ import { Sun, Moon, Menu, X } from "lucide-react";
 import Image from "next/image";
 
 const internalLinks = [
-  { href: "/pool", label: "Pool" },
+  { href: "/pool",   label: "Pool" },
+  { href: "/shares", label: "Shares" },
 ];
 
 const externalLinks = [
