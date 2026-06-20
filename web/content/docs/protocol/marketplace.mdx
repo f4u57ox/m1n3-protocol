@@ -1,0 +1,51 @@
+---
+title: Marketplace
+description: How the on-chain mining share marketplace works
+---
+
+## Overview
+
+The m1n3 marketplace is a fully on-chain exchange for mining shares on Sui. Miners can list shares for sale immediately after submission, and buyers can purchase shares to gain exposure to mining rewards.
+
+## Listing a Share
+
+1. Submit a mining share (full/NFT mode) to create a tradeable asset
+2. Set a listing price in SUI
+3. The share is listed on the marketplace, visible to all participants
+
+## Buying a Share
+
+1. Browse available listings on the marketplace
+2. Purchase a share at the listed price
+3. A 2% fee is deducted and distributed to M1N3 stakers
+4. The share NFT is transferred to the buyer
+
+## Fee Structure
+
+| Fee | Amount | Recipient |
+|---|---|---|
+| Pool fee | **0%** | N/A — m1n3 has no pool fee |
+| Marketplace trading tax | **2%** | Distributed to all M1N3 stakers |
+| Holding/redeeming fee | **0%** | Miners who hold their own shares pay nothing |
+
+## Share Valuation
+
+Shares are valued using PPS (Pay-Per-Share) methodology:
+
+- **Theoretical value** = share difficulty converted to hashrate equivalent, priced at current hashprice
+- **Market price** = what buyers are willing to pay (typically at a discount)
+- **Discount** = the difference between theoretical value and market price
+
+Discounts exist because buyers must wait ~16.5 hours for block maturation. The discount represents the **cost of capital** for that waiting period.
+
+## Why Discounts Create Opportunity
+
+Buyers who purchase shares at a discount and hold through maturation earn an annualized yield. For example:
+
+| Discount | Per-Trade ROI | Annualized Yield |
+|---|---|---|
+| 2% | 2.04% | ~107% |
+| 5% | 5.26% | ~277% |
+| 10% | 11.11% | ~585% |
+
+These yields are possible because the waiting period is short (~16.5h) but the per-trade return is positive.

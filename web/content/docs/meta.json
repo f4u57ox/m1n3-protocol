@@ -1,0 +1,13 @@
+{
+  "title": "m1n3 Documentation",
+  "pages": [
+    "---Getting Started---",
+    "getting-started",
+    "---Concepts---",
+    "concepts",
+    "---Protocol---",
+    "protocol",
+    "---Reference---",
+    "reference"
+  ]
+}

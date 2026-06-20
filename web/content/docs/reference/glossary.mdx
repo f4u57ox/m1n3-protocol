@@ -1,0 +1,116 @@
+---
+title: Glossary
+description: Technical terms used in the m1n3 protocol
+---
+
+## A
+
+**ARPT (Accumulated Reward Per Token)**
+The reward distribution model used for M1N3 staking. Tracks cumulative rewards per staked token, allowing stakers to claim proportional rewards at any time.
+
+**ASIC (Application-Specific Integrated Circuit)**
+Specialized hardware designed exclusively for Bitcoin mining (SHA-256 hashing). Vastly more efficient than GPUs or CPUs for this purpose.
+
+## B
+
+**Block Subsidy**
+The BTC reward given to the miner who finds a valid block. Currently 3.125 BTC (after the 2024 halving). Halves approximately every 4 years.
+
+**Block Template**
+A data structure defining which Bitcoin transactions a miner will attempt to include in a block. Contains the transaction set, merkle root, and difficulty target.
+
+## C
+
+**Coinbase Maturation**
+Bitcoin consensus rule requiring that newly mined BTC (coinbase rewards) cannot be spent for 100 blocks (~16.5 hours). m1n3's marketplace bypasses this wait by letting miners sell shares immediately.
+
+## D
+
+**Difficulty**
+A measure of how hard it is to find a valid block hash. Adjusts every 2,016 blocks to maintain ~10 minute block times. See [Difficulty & Adjustments](/docs/concepts/difficulty).
+
+**Double-Hash**
+Bitcoin's proof-of-work uses SHA-256 applied twice: `SHA256(SHA256(block_header))`. Sui's native SHA-256 function enables trustless on-chain verification.
+
+## F
+
+**Fill Rate**
+The percentage of marketplace listings that result in a sale. Higher fill rates indicate a healthier, more liquid market.
+
+**FPPS (Full Pay-Per-Share)**
+A pool payout method where miners are paid for both the block subsidy and transaction fees on a per-share basis. m1n3's 0% fee compares favorably to the typical 2% FPPS fee charged by major pools.
+
+## G
+
+**Gas**
+The fee paid to execute transactions on the Sui blockchain. m1n3 operations (share submission, staking, trading) require small amounts of SUI for gas.
+
+**Gossip Node**
+A m1n3 component that monitors Bitcoin Core for new blocks and submits block registration transactions to Sui.
+
+## H
+
+**Hashprice**
+Revenue per petahash per day ($/PH/day). The key metric for valuing mining output. See [Hashprice & PPS Valuation](/docs/concepts/hashprice).
+
+**Hashrate**
+The total computational power being used for mining, measured in hashes per second. 1 PH/s = 10^15 hashes/second.
+
+## L
+
+**Luck Factor**
+Ratio of expected vs actual blocks found by a pool. > 1.0 means lucky (more blocks than expected), < 1.0 means unlucky.
+
+**Lightweight Share**
+A share recorded as an event only (no NFT), saving ~84% in gas costs. Cannot be traded on the marketplace.
+
+## M
+
+**M1N3 Token**
+The native token of the m1n3 protocol. Minted only through block registration by node runners. Used for staking on templates.
+
+**Merkle Root**
+A hash that summarizes all transactions in a block. Part of the 80-byte block header.
+
+**MPC (Multi-Party Computation)**
+Cryptographic technique allowing multiple parties to jointly compute a function (like signing a Bitcoin transaction) without any single party having full control.
+
+## N
+
+**Nonce**
+A 4-byte field in the block header that miners increment to produce different hashes. Part of the proof-of-work process.
+
+## P
+
+**PPS (Pay-Per-Share)**
+A pool payout model where each share has a deterministic value based on its difficulty and the current network state.
+
+**Pool Difficulty**
+The minimum difficulty target set by the pool for accepting shares. Much lower than network difficulty, allowing frequent share submissions.
+
+## S
+
+**SHA-256**
+The cryptographic hash function used in Bitcoin's proof-of-work. Sui has native SHA-256 support, enabling trustless on-chain verification.
+
+**Share**
+A proof-of-work submission that meets the pool's difficulty target. In m1n3, shares can be minted as NFTs and traded on the marketplace.
+
+**Sharpe Ratio**
+A risk-adjusted return metric. Above 2.0 is considered excellent, above 1.0 is good. Used to evaluate the quality of marketplace trading returns.
+
+**Stratum**
+The mining protocol used by miners to communicate with pool servers. m1n3's stratum server bridges this protocol to the Sui blockchain.
+
+## T
+
+**TAM (Total Addressable Market)**
+The total daily Bitcoin mining revenue that m1n3 could capture as a trading marketplace.
+
+**Template**
+See Block Template.
+
+## V
+
+**Vardiff (Variable Difficulty)**
+Dynamic difficulty adjustment per miner. The stratum server adjusts each miner's share difficulty to target a consistent submission rate.

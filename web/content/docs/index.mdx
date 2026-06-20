@@ -1,0 +1,38 @@
+---
+title: Welcome to m1n3
+description: A decentralized Bitcoin mining protocol on Sui
+---
+
+## What is m1n3?
+
+**m1n3** is a decentralized Bitcoin mining protocol built on the Sui blockchain with four distinct roles:
+
+- **Node Running** — run a Bitcoin full node and register blocks on-chain to mint M1N3 tokens (the only minting path)
+- **Token** — M1N3 is the native incentive token, used for staking on block templates
+- **Mining & Templates** — miners build their own block templates or use on-chain templates, perform SHA-256 PoW, and submit shares to Sui for trustless verification
+- **Share Trading** — mining shares are tradeable on-chain assets, redeemable for BTC rewards
+
+No pool operator controls your templates, tokens, or bitcoin. Miners who hold and redeem their shares pay zero fees.
+
+## A Futures Market for Hashrate
+
+m1n3 turns every mining share into a tradeable on-chain asset on Sui. Each share represents a verifiable proof-of-work contribution to a block template — and a claim on future BTC rewards if that block is found.
+
+Think of shares as *futures contracts on hashrate*: buy them for exposure to mining upside, or sell them to lock in value immediately — all without running a single ASIC.
+
+## Skip the 100-Block Wait
+
+When a Bitcoin block is found, its coinbase reward is **locked for 100 blocks** (~16.5 hours) before it can be spent. Traditional pools force miners to wait through this maturation period before distributing payouts.
+
+| Traditional Pool | m1n3 |
+|---|---|
+| Mine → block found → wait ~16.5 hrs → coinbase matures → payout | Mine → share minted on Sui → trade instantly on the marketplace |
+
+Because shares live on Sui, they carry instant liquidity. Sell a share the moment it's minted, or hold it to redeem the BTC reward later — the choice is yours.
+
+## Get Started
+
+- [Miner Setup](/docs/getting-started/miner-setup) — connect your mining hardware
+- [Node Runner Setup](/docs/getting-started/node-runner) — run a Bitcoin node and earn M1N3
+- [How It Works](/docs/protocol/how-it-works) — understand the protocol architecture
+- [Core Concepts](/docs/concepts) — learn about shares, templates, and hashprice

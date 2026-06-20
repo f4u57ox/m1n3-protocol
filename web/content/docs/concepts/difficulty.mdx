@@ -1,0 +1,42 @@
+---
+title: Difficulty & Adjustments
+description: How Bitcoin adjusts mining difficulty and what it means for m1n3
+---
+
+## Network Difficulty
+
+Bitcoin's difficulty is a measure of how hard it is to find a valid block hash. The network automatically adjusts difficulty every **2,016 blocks** (~2 weeks) to maintain an average block time of **10 minutes**.
+
+- If blocks are found too fast → difficulty increases
+- If blocks are found too slow → difficulty decreases
+
+## Impact on Mining Shares
+
+Higher difficulty means:
+- Each share represents **more work** (more hashes needed to find a valid share)
+- Individual shares are **worth more** in PPS terms
+- But they are also **harder to find**, so total revenue depends on hashrate
+
+## Pool Difficulty vs Network Difficulty
+
+m1n3 uses a separate **pool difficulty** that is much lower than the network difficulty. This allows miners to submit shares frequently (proving they are doing work) without needing to find an actual Bitcoin block.
+
+- **Pool min difficulty** — the minimum share difficulty accepted by the pool
+- **Vardiff** — the stratum server dynamically adjusts each miner's difficulty to target a consistent share submission rate
+
+## Difficulty Adjustments
+
+The Stats page tracks:
+- **Next difficulty adjustment** — estimated change percentage
+- **Remaining blocks** — how many blocks until the next adjustment
+- **Epoch progress** — percentage of the current 2,016-block epoch completed
+
+A positive adjustment (difficulty increase) generally means more hashrate has joined the network, which reduces each miner's expected revenue. A negative adjustment means hashrate has left.
+
+## Luck Factor
+
+The pool's **luck factor** compares actual blocks found to the expected number based on total shares and difficulty:
+
+- **> 1.0** — the pool is "lucky" (finding more blocks than expected)
+- **< 1.0** — the pool is "unlucky" (finding fewer blocks than expected)
+- Over time, luck converges toward 1.0

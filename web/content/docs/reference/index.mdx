@@ -1,0 +1,35 @@
+---
+title: Reference
+description: Configuration values, package IDs, and technical reference
+---
+
+## Deployed Package Addresses
+
+See `contracts/Published.toml` for current testnet and mainnet package IDs.
+
+## Dashboard Environment Variables
+
+Full `.env.local` template for the dashboard:
+
+```ini title=".env.local"
+# Sui Network
+NEXT_PUBLIC_SUI_NETWORK=devnet
+NEXT_PUBLIC_SUI_RPC_URL=https://fullnode.devnet.sui.io:443
+
+# m1n3 package and shared objects (from Published.toml after deployment)
+NEXT_PUBLIC_PACKAGE_ID=<PACKAGE_ID>
+NEXT_PUBLIC_POOL_OBJECT_ID=<POOL_OBJECT_ID>
+```
+
+## Gas Fee Estimates
+
+Approximate SUI gas per operation:
+
+| Operation | Estimated Cost |
+|---|---|
+| Miner Registration | ~0.001 SUI |
+| Share Submission (PTB) | ~0.001 SUI |
+| Round Close | ~0.002 SUI |
+| Template Registration | ~0.001 SUI |
+
+Actual costs depend on network conditions and the number of shares in a batch.

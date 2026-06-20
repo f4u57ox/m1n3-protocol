@@ -1,0 +1,30 @@
+---
+title: Block Templates
+description: How miners choose which transactions to mine
+---
+
+## What is a Block Template?
+
+A block template defines which Bitcoin transactions a miner will include in a block. It contains the transaction set, the merkle root, and the target difficulty. In traditional mining, pool operators create templates centrally. In m1n3, **anyone running a Bitcoin full node** can create and register templates on-chain.
+
+## Template Creation
+
+1. A node runner constructs a block template from their local Bitcoin full node, choosing which transactions to include
+2. The template is registered on the Sui blockchain
+3. Each template shows: total work dedicated, number of unique miners, and total M1N3 staked
+
+## Choosing a Template
+
+Miners can:
+- **Use their own template (Solo mode)** — build from their own Bitcoin full node
+- **Use an on-chain template (Pooled mode)** — pick a template registered by another node runner
+
+On-chain visibility gives miners full transparency before they choose where to direct hashpower. Templates with more stake and more miners may be seen as more trustworthy.
+
+## Template Staking
+
+M1N3 token holders can stake on templates to:
+- Signal confidence in a template (visible to miners choosing where to mine)
+- Earn a proportional share of the 2% marketplace trading fee
+
+See [Staking](/docs/concepts/staking) for details.

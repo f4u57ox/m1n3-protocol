@@ -1,0 +1,51 @@
+---
+title: Architecture
+description: System components of the m1n3 protocol
+---
+
+## System Overview
+
+The m1n3 protocol consists of five main components that work together to enable decentralized Bitcoin mining on Sui.
+
+## Sui Move Contracts
+
+Core protocol logic deployed on the Sui blockchain:
+
+- **Template registration** — on-chain block template registry
+- **Share verification** — SHA-256 double-hash verification
+- **Token minting** — M1N3 token creation through block registration
+- **Staking** — template staking and fee distribution (ARPT model)
+- **Reward distribution** — BTC reward claims
+
+## Stratum Server
+
+Rust service that bridges miners to the Sui blockchain:
+
+- Speaks the Stratum v1 mining protocol to connect standard mining hardware
+- Manages per-miner difficulty adjustment (vardiff)
+- Batches and submits valid shares to the Sui blockchain
+- Supports both solo and pooled mining modes
+
+## Gateway
+
+Interfaces with the miner's Bitcoin full node:
+
+- Constructs block templates from the local Bitcoin node
+- Relays work to connected miners via Stratum
+- Monitors for new blocks and template updates
+
+## Gossip Node
+
+Peer-to-peer network for block registration:
+
+- Monitors Bitcoin Core for new blocks
+- Submits block registration transactions to Sui
+- First-come-first-served M1N3 token minting
+
+## MPC Bitcoin Distribution
+
+Non-custodial Bitcoin signing:
+
+- MPC (Multi-Party Computation) technology for trustless signing
+- Enables Bitcoin reward distribution to share holders
+- Enforced by the smart contract — no single party controls funds

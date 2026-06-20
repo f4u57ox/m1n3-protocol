@@ -1,0 +1,42 @@
+---
+title: Hashprice & PPS Valuation
+description: How mining revenue per unit of hashrate is measured and used
+---
+
+## What is Hashprice?
+
+**Hashprice** measures how much revenue a unit of mining power generates per day. It is expressed as **$/PH/day** (dollars per petahash per day).
+
+Hashprice depends on:
+- **BTC price** — higher BTC price means more revenue per hash
+- **Network difficulty** — higher difficulty means each hash is worth less
+- **Block subsidy** — currently 3.125 BTC per block (post-2024 halving)
+- **Transaction fees** — additional revenue from fees included in blocks
+
+## Why Hashprice Matters
+
+Hashprice is the fundamental metric for:
+- **Valuing mining shares** — each share's work can be priced in hashprice terms
+- **Comparing pool economics** — standardized measure across different pools
+- **Assessing profitability** — miners can compare hashprice against their electricity costs
+
+## PPS (Pay-Per-Share) Valuation
+
+In a PPS model, each share has a deterministic value based on:
+1. The share's difficulty (how much work it represents)
+2. The current network difficulty (scaling factor)
+3. The block reward (subsidy + fees)
+
+```
+Share Value = (share_difficulty × 2³²) / network_difficulty × block_reward
+```
+
+m1n3 uses this PPS valuation as the theoretical fair value for shares on the marketplace. Shares typically trade at a discount to PPS value because buyers must wait for block maturation (~16.5 hours).
+
+## Hashprice Trends
+
+Hashprice tends to decline over time due to:
+- **Difficulty increases** as more miners join the network
+- **Halving events** every ~4 years that cut the block subsidy in half
+
+However, BTC price appreciation can offset these effects. The Stats page on the dashboard tracks hashprice trends in real time.

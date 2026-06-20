@@ -1,0 +1,65 @@
+---
+title: How It Works
+description: End-to-end flow of the m1n3 protocol
+---
+
+## Overview
+
+m1n3 is a decentralized Bitcoin mining protocol built on the Sui blockchain with four distinct roles:
+
+- **Node Running** — run a Bitcoin full node and register blocks on-chain to mint M1N3 tokens
+- **Token** — M1N3 is the native incentive token, used for staking on block templates
+- **Mining & Templates** — miners perform SHA-256 PoW and submit shares to Sui for trustless verification
+- **Share Trading** — mining shares are tradeable on-chain assets, redeemable for BTC rewards
+
+## Node Runners
+
+Bitcoin full nodes are critical to the network's decentralization, yet they have no built-in financial incentive. m1n3 solves this: node runners register blocks on-chain and earn M1N3 tokens — the **only** way tokens are minted.
+
+- Run a Bitcoin full node
+- Register blocks on-chain via Sui
+- Earn M1N3 tokens for each registered block
+- Strengthen Bitcoin's decentralization
+
+## M1N3 Token
+
+The M1N3 token is minted exclusively through node running — when node runners register blocks on-chain.
+
+- **Minting:** Only through block registration by node runners — no pre-mine, no other minting path
+- **Utility:** Stake on block templates to signal confidence and earn a share of the 2% share-trading tax
+- **Tradeable:** Instantly liquid on-chain — no waiting for a Bitcoin block to be found
+
+## Block Templates & Mining
+
+### 1. Template Creation
+Miners build their own block template from their local Bitcoin full node — choosing which transactions to include — or fetch a template already registered on-chain by another node runner.
+
+### 2. On-Chain Template Visibility
+Each template registered on Sui is publicly visible and shows: total work dedicated, number of unique miners, and total M1N3 staked — giving miners full transparency before they choose where to direct hashpower.
+
+### 3. Mining & Share Submission
+Miners perform SHA-256 double-hash Proof of Work against their chosen template. When a valid share meeting the pool difficulty target is found, it is submitted as a transaction to the Sui blockchain.
+
+### 4. On-Chain Verification
+Sui's native SHA-256 function verifies the double-hash and validates that the share meets the required difficulty target. No off-chain trust is required — verification is fully trustless.
+
+## Mining Shares
+
+Mining shares in m1n3 are not just Proof of Work receipts — they are fully tradeable on-chain assets that unlock a futures market for hashrate.
+
+- **Tradeable:** Buy and sell shares on the open market
+- **Redeemable:** Redeem shares for BTC rewards when blocks are found
+- **Speculation & Hedging:** Enables a futures market — speculate on hashrate or hedge mining output
+- **2% Transfer Tax:** A 2% tax on share trades is distributed to all M1N3 stakers
+- **Zero Cost for Holders:** Miners who hold and redeem their own shares pay nothing
+
+## Why m1n3
+
+### Dynamic Hashrate Tokenization
+Legacy hashrate tokenization projects use fixed-rate tokens that get diluted as global hashpower increases. m1n3 shares represent actual work performed at actual network difficulty — a direct, undiluted claim on mining output.
+
+### Exchange-Grade Liquidity
+Miners traditionally lack an immediate exit for their hashrate. m1n3 creates a secondary market: sell shares for immediate cash, or trade and hedge your mining output — all on-chain with instant settlement.
+
+### Zero Pool Fees
+0% pool fee vs the industry standard 2%. The only fee in the ecosystem is a 2% tax on share trading, distributed entirely to M1N3 stakers. Mine and redeem = keep everything.

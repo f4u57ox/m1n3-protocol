@@ -1,0 +1,35 @@
+---
+title: Mining Shares
+description: Tradeable on-chain proof-of-work assets
+---
+
+## What is a Mining Share?
+
+A mining share in m1n3 is a verified proof-of-work submission recorded on the Sui blockchain. Unlike traditional pools where shares are just internal accounting entries, m1n3 shares are **on-chain assets** that can be traded on the marketplace.
+
+## Share Types
+
+m1n3 supports two share submission modes:
+
+| Type | Description | Gas Cost |
+|---|---|---|
+| **Full (NFT)** | Creates a MiningShare NFT on Sui, tradeable on the marketplace | Standard |
+| **Lite (Event)** | Recorded as an event only (no NFT), ~84% gas savings | Reduced |
+
+Lite shares save significant gas costs but cannot be traded on the marketplace. They still count toward pool statistics and block-finding eligibility.
+
+## Share Lifecycle
+
+1. **Submission** — Miner finds a hash meeting the pool's difficulty target
+2. **Verification** — Sui's native SHA-256 function verifies the double-hash on-chain
+3. **Recording** — Share is minted as an NFT (full) or emitted as an event (lite)
+4. **Trading** — Full shares can be listed on the marketplace immediately
+5. **Redemption** — When a block is found, share holders can redeem BTC rewards
+
+## Trading & Fees
+
+- **2% Transfer Tax** — Applied when shares are traded on the marketplace
+- **Zero Cost for Holders** — Miners who hold and redeem their own shares pay nothing
+- **Instant Liquidity** — Sell a share the moment it's minted, bypassing the 100-block maturation wait
+
+> **Comparison:** Most mining pools charge 2% on *all* rewards. m1n3 charges **0%** pool fees. The 2% tax only applies when shares are traded, and it goes directly to M1N3 stakers — not to a pool operator.

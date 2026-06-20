@@ -1,0 +1,35 @@
+---
+title: Reward Distribution
+description: How BTC rewards are distributed to mining share holders
+---
+
+## Overview
+
+When the m1n3 pool finds a Bitcoin block, the coinbase reward (currently 3.125 BTC) needs to be distributed to share holders. m1n3 uses MPC (Multi-Party Computation) technology for trustless, non-custodial Bitcoin distribution.
+
+## How It Works
+
+1. **Block found** — the pool mines a valid Bitcoin block
+2. **Coinbase maturation** — the reward is locked for 100 blocks (~16.5 hours) per Bitcoin consensus rules
+3. **Reward calculation** — each share's contribution is calculated based on its difficulty relative to the total work in that round
+4. **MPC signing** — the MPC network signs Bitcoin transactions distributing rewards to share holders
+5. **Distribution** — BTC is sent directly to share holders' Bitcoin addresses
+
+## Share Holder Options
+
+After a block is found, share holders have two paths:
+
+### Hold & Redeem
+Wait for the coinbase to mature and claim your BTC reward. This path has **zero fees** — you keep the full value of your share.
+
+### Sell on Marketplace
+Sell your share immediately on the m1n3 marketplace. This gives you instant liquidity but at a discount (since the buyer must wait for maturation). A 2% marketplace fee applies, distributed to M1N3 stakers.
+
+## MPC Technology
+
+The reward distribution system uses dWallet/IKA MPC technology:
+
+- **Non-custodial** — no single party controls the BTC
+- **Trustless** — signing is enforced by the smart contract
+- **Decentralized** — multiple parties must cooperate to sign transactions
+- **Automatic** — reward distribution happens without manual intervention

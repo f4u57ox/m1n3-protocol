@@ -1,0 +1,60 @@
+---
+title: Node Runner Setup
+description: Run a Bitcoin full node to support the m1n3 pool
+---
+
+## Requirements
+
+| Requirement | Description |
+|---|---|
+| **Bitcoin Core** | Full node with RPC enabled (v25+ recommended) |
+| **Disk Space** | ~600 GB for the Bitcoin blockchain |
+
+## Bitcoin Core Setup
+
+### 1. Install Bitcoin Core
+
+```bash
+# macOS
+brew install bitcoin
+
+# Ubuntu/Debian
+sudo apt install bitcoind
+```
+
+### 2. Configure bitcoin.conf
+
+```ini title="~/.bitcoin/bitcoin.conf"
+server=1
+rpcuser=your_rpc_user
+rpcpassword=your_rpc_password
+rpcallowip=127.0.0.1
+rpcport=8332
+txindex=1
+```
+
+### 3. Start and sync
+
+```bash
+bitcoind -daemon
+```
+
+Initial sync may take several days. Monitor progress with:
+
+```bash
+bitcoin-cli getblockchaininfo
+```
+
+### 4. Verify RPC is working
+
+```bash
+bitcoin-cli getblockcount
+```
+
+This should return the current block height.
+
+## Usage with m1n3
+
+Point the stratum server at your local Bitcoin Core node using `--bitcoin-rpc http://user:pass@127.0.0.1:8332`.
+
+Block template data flows from Bitcoin Core → stratum server → miners. The stratum server calls `getblocktemplate` periodically and pushes new work to all connected miners via `mining.notify`.

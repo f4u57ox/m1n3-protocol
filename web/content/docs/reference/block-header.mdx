@@ -1,0 +1,46 @@
+---
+title: Block Header Structure
+description: The 80-byte Bitcoin block header used in proof-of-work
+---
+
+## Overview
+
+Every Bitcoin block header is exactly **80 bytes**, divided into six fields. Miners hash this header repeatedly with different nonce values to find a valid proof-of-work.
+
+## Fields
+
+| Field | Bytes | Size | Description |
+|---|---|---|---|
+| **Version** | 0–3 | 4 bytes | Block version number, indicates which set of validation rules to follow |
+| **PrevHash** | 4–35 | 32 bytes | Hash of the previous block header, linking this block to the chain |
+| **MerkleRoot** | 36–67 | 32 bytes | Hash summarizing all transactions included in this block |
+| **nTime** | 68–71 | 4 bytes | Unix timestamp of when the miner started hashing this header |
+| **nBits** | 72–75 | 4 bytes | Compact representation of the target difficulty |
+| **Nonce** | 76–79 | 4 bytes | Counter that miners increment to produce different hashes |
+
+## How Mining Works
+
+1. The miner constructs a block header with the six fields above
+2. The header is hashed using SHA-256 twice: `SHA256(SHA256(header))`
+3. If the resulting hash is below the target (determined by nBits), the block is valid
+4. If not, the miner increments the nonce and tries again
+5. When the 4-byte nonce space is exhausted, the miner modifies other fields (typically nTime or the coinbase transaction, which changes the MerkleRoot)
+
+## On-Chain Verification
+
+Sui's native SHA-256 function allows m1n3 to verify proof-of-work on-chain:
+
+1. The miner submits the 80-byte block header as a transaction to Sui
+2. The Move contract performs the double SHA-256 hash
+3. The result is checked against the pool's difficulty target
+4. If valid, the share is recorded on-chain
+
+This process is **fully trustless** — no off-chain oracle or trusted third party is needed.
+
+## Extradata / Coinbase
+
+Beyond the 80-byte header, miners can modify the **coinbase transaction** (the first transaction in a block) to:
+
+- Change the merkle root (enabling a much larger search space beyond the 4-byte nonce)
+- Include custom data (like pool identification strings)
+- Set the reward payout address

@@ -1,0 +1,77 @@
+---
+title: Miner Setup
+description: Connect your mining hardware to a m1n3 pool and start earning shares
+---
+
+## Requirements
+
+| Requirement | Description |
+|---|---|
+| **Sui Wallet** | A Sui address to receive mining shares and submit transactions |
+| **Mining Hardware** | Any SHA-256 mining hardware (ASIC recommended for mainnet) |
+| **Internet Connection** | Stable connection to reach the stratum server |
+| **SUI for Gas** | Small amount of SUI tokens to pay for on-chain transactions |
+
+## Sui Wallet Setup
+
+### 1. Install Sui CLI
+
+```bash
+cargo install --locked --git https://github.com/MystenLabs/sui.git --branch devnet sui
+```
+
+Or download a pre-built binary from the [Sui releases page](https://github.com/MystenLabs/sui/releases).
+
+### 2. Create a new address
+
+```bash
+sui client new-address ed25519
+# Save the recovery phrase securely!
+```
+
+### 3. Get your active address
+
+```bash
+sui client active-address
+```
+
+### 4. Fund your wallet
+
+Transfer a small amount of SUI to your address for gas fees. On devnet:
+
+```bash
+sui client faucet
+```
+
+## Option A: Connect to an Existing Pool
+
+Point your mining hardware at a running m1n3 stratum server:
+
+```
+stratum+tcp://<pool-server>:3333
+Username: <sui_address>.<worker_name>   (e.g. 0xe855cb8f...1780e.rig1)
+Password: x
+```
+
+**Username format:** Your Sui hex address followed by a dot and a worker name of your choice.
+
+## Option B: Trustless Mode (miner-sidecar)
+
+The sidecar lets you submit accepted shares directly to Sui with your own keypair — the pool operator is never in the attribution path.
+
+```bash
+./target/release/miner-sidecar \
+  --stratum-host <pool-server>:3333 \
+  --listen-port 3334 \
+  --sui-keystore ~/.sui/sui_config/sui.keystore \
+  --sui-package <PACKAGE_ID> \
+  --pool-object <POOL_OBJECT_ID>
+
+# Point your mining hardware to localhost:3334
+```
+
+## Miner Registration
+
+Your `MinerStats` object is created automatically on your first share submission. This is an owned Sui object that tracks your lifetime work and payout address.
+
+> If you switch to a new Sui address, registration happens automatically on the first share from the new address.

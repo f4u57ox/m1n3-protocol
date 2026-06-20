@@ -1,0 +1,98 @@
+---
+title: Pool Operator Setup
+description: Run the full m1n3 stack — Bitcoin node, stratum server, and operator bot
+---
+
+## Requirements
+
+| Requirement | Description |
+|---|---|
+| **Bitcoin Core** | Full node with RPC enabled (v25+ recommended) |
+| **Rust Toolchain** | Rust 1.75+ for all binaries |
+| **Sui CLI** | For contract deployment and keypair management |
+| **Node.js 20+** | For the IKA service and dashboard |
+| **Funded Sui Wallet** | SUI tokens for gas on all on-chain operations |
+
+## 1. Deploy the contracts
+
+```bash
+cd contracts
+sui client publish --gas-budget 200000000
+```
+
+Note the package ID and all shared object IDs printed after deployment.
+
+## 2. Stratum Server
+
+```bash
+BITCOIN_RPC_URL=http://user:pass@127.0.0.1:8332 \
+./target/release/stratum-server \
+  --sui-package <PACKAGE_ID> \
+  --pool-object <POOL_OBJECT_ID> \
+  --pool-admin-cap <ADMIN_CAP_ID> \
+  --pool-address <HEX_SCRIPTPUBKEY> \
+  --sui-rpc-url https://fullnode.devnet.sui.io:443 \
+  --sui-keystore ~/.sui/sui_config/sui.keystore \
+  --port 3333 \
+  --metrics-port 9091 \
+  --initial-difficulty 10000 \
+  --target-shares-per-min 10
+```
+
+> Adjust `--initial-difficulty` and `--target-shares-per-min` based on your pool's total hashrate.
+
+## 3. Operator Bot
+
+The operator bot drives round close and reward distribution.
+
+```bash
+BITCOIN_RPC_URL=http://user:pass@127.0.0.1:8332 \
+./target/release/operator-bot \
+  --sui-package <PACKAGE_ID> \
+  --pool-object <POOL_OBJECT_ID> \
+  --pool-admin-cap <ADMIN_CAP_ID> \
+  --sui-rpc-url https://fullnode.devnet.sui.io:443 \
+  --sui-keystore ~/.sui/sui_config/sui.keystore
+```
+
+## 4. IKA Service (optional — Ika reward path)
+
+The IKA service handles dWallet-based Bitcoin signing for the Ika reward path.
+
+```bash
+cd ika-service
+npm install
+```
+
+Configure `.env` (see `ika-service/.env.example`):
+
+```ini
+IKA_NETWORK=mainnet
+IKA_HTTP_PORT=3000
+IKA_SOCKET_PATH=/tmp/m1n3-ika.sock
+```
+
+```bash
+npm start
+```
+
+## 5. Dashboard
+
+```bash
+cd dashboard
+npm install
+```
+
+Create `.env.local`:
+
+```ini
+NEXT_PUBLIC_SUI_NETWORK=devnet
+NEXT_PUBLIC_SUI_RPC_URL=https://fullnode.devnet.sui.io:443
+NEXT_PUBLIC_PACKAGE_ID=<PACKAGE_ID>
+NEXT_PUBLIC_POOL_OBJECT_ID=<POOL_OBJECT_ID>
+```
+
+```bash
+npm run build
+# Deploy the out/ directory to any static host
+```
