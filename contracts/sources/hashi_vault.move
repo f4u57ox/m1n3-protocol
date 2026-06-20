@@ -43,8 +43,10 @@ module m1n3_v4::hashi_vault {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const EZeroAmount: u64 = 1;
-    const EInsufficientBalance: u64 = 2;
+    #[error]
+    const EZeroAmount: vector<u8> = b"Amount must be greater than zero";
+    #[error]
+    const EInsufficientBalance: vector<u8> = b"Vault has insufficient balance for this withdrawal";
 
     // ── Object ────────────────────────────────────────────────────────────────
 

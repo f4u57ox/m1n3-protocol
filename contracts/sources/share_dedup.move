@@ -28,9 +28,12 @@ module m1n3_v4::share_dedup {
 
     // ── Error codes ───────────────────────────────────────────────────────────
 
-    const EDuplicateShare:   u64 = 2;
-    const EAlreadyRegistered: u64 = 3;
-    const ENotOwner:          u64 = 11;
+    #[error]
+    const EDuplicateShare: vector<u8> = b"This share hash has already been submitted by this miner against this template";
+    #[error]
+    const EAlreadyRegistered: vector<u8> = b"A ShareDedup already exists for this (miner, template) pair";
+    #[error]
+    const ENotOwner: vector<u8> = b"Caller is not the owner of this ShareDedup";
 
     // ── Registry key ─────────────────────────────────────────────────────────
 

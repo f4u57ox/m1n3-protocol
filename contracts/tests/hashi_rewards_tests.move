@@ -188,7 +188,7 @@ module m1n3_v4::hashi_rewards_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 10)] // ERoundMismatch
+    #[expected_failure(abort_code = m1n3_v4::hashi_rewards::ERoundMismatch)]
     fun trustless_funding_aborts_on_round_mismatch() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
@@ -429,7 +429,7 @@ module m1n3_v4::hashi_rewards_tests {
     // ── Negative paths ────────────────────────────────────────────────────────
 
     #[test]
-    #[expected_failure(abort_code = 8)] // EClaimDeadlinePassed
+    #[expected_failure(abort_code = m1n3_v4::hashi_rewards::EClaimDeadlinePassed)]
     fun reject_claim_after_deadline() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
@@ -459,7 +459,7 @@ module m1n3_v4::hashi_rewards_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 9)] // EDeadlineNotReached
+    #[expected_failure(abort_code = m1n3_v4::hashi_rewards::EDeadlineNotReached)]
     fun reject_recycle_before_deadline() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
@@ -487,7 +487,7 @@ module m1n3_v4::hashi_rewards_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 2)] // EInvalidStatus (already EXPIRED)
+    #[expected_failure(abort_code = m1n3_v4::hashi_rewards::EInvalidStatus)]
     fun reject_recycle_on_expired_batch() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
@@ -532,7 +532,7 @@ module m1n3_v4::hashi_rewards_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 12)] // EWrongMiner
+    #[expected_failure(abort_code = m1n3_v4::hashi_rewards::EWrongMiner)]
     fun reject_claim_wrong_miner() {
         // Hand MINER_A's MWR to MINER_B and have B try to claim.
         let mut sc = ts::begin(ADMIN);

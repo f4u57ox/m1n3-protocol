@@ -84,7 +84,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: initialize ─────────────────────────────────────────────────────
 
     #[test]
-    fun test_initialize_stores_fields() {
+    fun initialize_stores_fields() {
         let mut sc = setup();
         ts::next_tx(&mut sc, ADMIN);
         {
@@ -101,7 +101,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidBtcAddress)]
-    fun test_initialize_rejects_short_btc_address() {
+    fun initialize_rejects_short_btc_address() {
         let mut sc = ts::begin(ADMIN);
         ts::next_tx(&mut sc, ADMIN);
         {
@@ -120,7 +120,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: update_btc_address ─────────────────────────────────────────────
 
     #[test]
-    fun test_update_btc_address() {
+    fun update_btc_address() {
         let mut sc = setup();
         ts::next_tx(&mut sc, ADMIN);
         {
@@ -136,7 +136,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidBtcAddress)]
-    fun test_update_btc_address_rejects_short() {
+    fun update_btc_address_rejects_short() {
         let mut sc = setup();
         ts::next_tx(&mut sc, ADMIN);
         {
@@ -152,7 +152,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: record_block_found ─────────────────────────────────────────────
 
     #[test]
-    fun test_record_block_found_creates_record() {
+    fun record_block_found_creates_record() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -174,7 +174,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_record_block_found_indexes_by_round() {
+    fun record_block_found_indexes_by_round() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -194,7 +194,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidTxid)]
-    fun test_record_block_found_rejects_short_txid() {
+    fun record_block_found_rejects_short_txid() {
         let mut sc = setup();
         mint_claim(&mut sc, ROUND_1);
         ts::next_tx(&mut sc, ADMIN);
@@ -216,7 +216,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: full happy-path state machine ──────────────────────────────────
 
     #[test]
-    fun test_register_with_hashi_transitions_to_registered() {
+    fun register_with_hashi_transitions_to_registered() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -235,7 +235,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_set_hashi_request_id() {
+    fun set_hashi_request_id() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -257,7 +257,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_full_deposit_state_machine() {
+    fun full_deposit_state_machine() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -317,7 +317,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: mark_hashi_failed ──────────────────────────────────────────────
 
     #[test]
-    fun test_mark_hashi_failed_from_registered() {
+    fun mark_hashi_failed_from_registered() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -337,7 +337,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_mark_hashi_failed_from_approved() {
+    fun mark_hashi_failed_from_approved() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -359,7 +359,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidStatus)]
-    fun test_mark_hashi_failed_from_unregistered_fails() {
+    fun mark_hashi_failed_from_unregistered_fails() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -379,7 +379,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidStatus)]
-    fun test_register_twice_fails() {
+    fun register_twice_fails() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -400,7 +400,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidStatus)]
-    fun test_set_request_id_before_register_fails() {
+    fun set_request_id_before_register_fails() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -418,7 +418,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidStatus)]
-    fun test_approve_before_register_fails() {
+    fun approve_before_register_fails() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -436,7 +436,7 @@ module m1n3_v4::hashi_pool_tests {
 
     #[test]
     #[expected_failure(abort_code = m1n3_v4::hashi_pool::EInvalidStatus)]
-    fun test_confirm_before_approve_fails() {
+    fun confirm_before_approve_fails() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -460,7 +460,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: clear_pending_sats ─────────────────────────────────────────────
 
     #[test]
-    fun test_clear_pending_sats_full() {
+    fun clear_pending_sats_full() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -504,7 +504,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_clear_pending_sats_partial() {
+    fun clear_pending_sats_partial() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -545,7 +545,7 @@ module m1n3_v4::hashi_pool_tests {
     }
 
     #[test]
-    fun test_clear_pending_sats_over_clamps_to_zero() {
+    fun clear_pending_sats_over_clamps_to_zero() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -588,7 +588,7 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: cumulative stats across two rounds ─────────────────────────────
 
     #[test]
-    fun test_two_rounds_accumulate_stats() {
+    fun two_rounds_accumulate_stats() {
         let mut sc = setup();
         record_block(&mut sc);
 
@@ -677,17 +677,17 @@ module m1n3_v4::hashi_pool_tests {
     // ── Tests: view helpers ───────────────────────────────────────────────────
 
     #[test]
-    fun test_p2tr_len_constant() {
+    fun p2tr_len_constant() {
         assert!(hashi_pool::p2tr_len() == 32, 0);
     }
 
     #[test]
-    fun test_p2wpkh_len_constant() {
+    fun p2wpkh_len_constant() {
         assert!(hashi_pool::p2wpkh_len() == 20, 0);
     }
 
     #[test]
-    fun test_status_constants_distinct() {
+    fun status_constants_distinct() {
         assert!(hashi_pool::dep_unregistered() == 0, 0);
         assert!(hashi_pool::dep_registered()   == 1, 1);
         assert!(hashi_pool::dep_approved()     == 2, 2);

@@ -41,17 +41,28 @@ module m1n3_v4::hash_share_market {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const ENotBuyer:     u64 = 1;
-    const ENotSeller:    u64 = 2;
-    const EOrderExhausted: u64 = 3;
-    const EInsufficientHashShares: u64 = 4;
-    const EOrderExpired: u64 = 6;
-    const ENotExpired:   u64 = 7;
-    const EZeroQty:      u64 = 8;
-    const ENotAdmin:     u64 = 9;
-    const EPriceTooLow:  u64 = 10;
-    const ENoPendingAdmin:  u64 = 11;
-    const ENotPendingAdmin: u64 = 12;
+    #[error]
+    const ENotBuyer: vector<u8> = b"Caller is not the buyer who placed this BuyOrder";
+    #[error]
+    const ENotSeller: vector<u8> = b"Caller is not the seller who placed this SellOrder";
+    #[error]
+    const EOrderExhausted: vector<u8> = b"Order has insufficient budget or inventory to satisfy this fill";
+    #[error]
+    const EInsufficientHashShares: vector<u8> = b"SellOrder inventory is below the requested fill quantity";
+    #[error]
+    const EOrderExpired: vector<u8> = b"Order has passed its expiration epoch";
+    #[error]
+    const ENotExpired: vector<u8> = b"Order has not yet reached its expiration epoch";
+    #[error]
+    const EZeroQty: vector<u8> = b"Quantity must be greater than zero";
+    #[error]
+    const ENotAdmin: vector<u8> = b"Caller is not the MarketFeePool admin";
+    #[error]
+    const EPriceTooLow: vector<u8> = b"Price per unit must be greater than zero";
+    #[error]
+    const ENoPendingAdmin: vector<u8> = b"No pending admin transfer proposal exists";
+    #[error]
+    const ENotPendingAdmin: vector<u8> = b"Caller is not the proposed pending admin";
 
     // ── Shared objects ────────────────────────────────────────────────────────
 
@@ -175,7 +186,7 @@ module m1n3_v4::hash_share_market {
         ctx: &mut TxContext,
     ) {
         assert!(price_per_unit_mist > 0, EPriceTooLow);
-        let budget_mist = coin::value(&payment);
+        let budget_mist = payment.value();
         let buyer = tx_context::sender(ctx);
         let exp = if (expires_epoch == 0) { option::none() } else { option::some(expires_epoch) };
 
@@ -183,7 +194,7 @@ module m1n3_v4::hash_share_market {
             id: object::new(ctx),
             buyer,
             price_per_unit_mist,
-            payment: coin::into_balance(payment),
+            payment: payment.into_balance(),
             expires_epoch: exp,
         };
         event::emit(BuyOrderPlaced {
@@ -197,7 +208,7 @@ module m1n3_v4::hash_share_market {
     }
 
     /// Seller hits a posted bid, paying `Coin<T>` and receiving net SUI.
-    /// `units_to_sell` controls partial fill; passing `coin::value(&payment)`
+    /// `units_to_sell` controls partial fill; passing `payment.value()`
     /// sells the whole coin.
     public fun fill_buy_order<T>(
         order: &mut BuyOrder<T>,
@@ -211,21 +222,21 @@ module m1n3_v4::hash_share_market {
                 EOrderExpired,
             );
         };
-        let units = coin::value(&payment_in);
+        let units = payment_in.value();
         assert!(units > 0, EZeroQty);
 
         let gross = mul_div(units, order.price_per_unit_mist, 1, rounding::down()).destroy_some();
-        assert!(balance::value(&order.payment) >= gross, EOrderExhausted);
+        assert!(order.payment.value() >= gross, EOrderExhausted);
 
         let seller = tx_context::sender(ctx);
         let fee = mul_div(gross, FEE_BPS, BPS_DENOM, rounding::down()).destroy_some();
         let net = gross - fee;
 
-        let mut sui_out = balance::split(&mut order.payment, gross);
-        let fee_balance = balance::split(&mut sui_out, fee);
+        let mut sui_out = order.payment.split(gross);
+        let fee_balance = sui_out.split(fee);
 
         // Hand HashShare inventory to the buyer.
-        transfer::public_transfer(coin::from_balance(coin::into_balance(payment_in), ctx), order.buyer);
+        transfer::public_transfer(coin::from_balance(payment_in.into_balance(), ctx), order.buyer);
         // Net SUI to seller.
         transfer::public_transfer(coin::from_balance(sui_out, ctx), seller);
         // Fee direct to admin — no shared-object write on fee_pool.
@@ -238,7 +249,7 @@ module m1n3_v4::hash_share_market {
             gross_mist: gross,
             fee_mist: fee,
             net_paid_mist: net,
-            budget_remaining_mist: balance::value(&order.payment),
+            budget_remaining_mist: order.payment.value(),
         });
     }
 
@@ -247,7 +258,7 @@ module m1n3_v4::hash_share_market {
         order: &mut BuyOrder<T>,
         payment: Coin<SUI>,
     ) {
-        balance::join(&mut order.payment, coin::into_balance(payment));
+        order.payment.join(payment.into_balance());
     }
 
     /// Buyer-only. Replaces the price; doesn't touch budget or inventory.
@@ -272,7 +283,7 @@ module m1n3_v4::hash_share_market {
     public fun cancel_buy_order<T>(order: BuyOrder<T>, ctx: &mut TxContext) {
         assert!(order.buyer == tx_context::sender(ctx), ENotBuyer);
         let BuyOrder { id, buyer, price_per_unit_mist: _, payment, expires_epoch: _ } = order;
-        let refund = balance::value(&payment);
+        let refund = payment.value();
         event::emit(OrderCancelled {
             order_id: object::uid_to_inner(&id),
             owner: buyer,
@@ -283,7 +294,7 @@ module m1n3_v4::hash_share_market {
         if (refund > 0) {
             transfer::public_transfer(coin::from_balance(payment, ctx), buyer);
         } else {
-            balance::destroy_zero(payment);
+            payment.destroy_zero();
         };
     }
 
@@ -296,7 +307,7 @@ module m1n3_v4::hash_share_market {
             ENotExpired,
         );
         let BuyOrder { id, buyer, price_per_unit_mist: _, payment, expires_epoch: _ } = order;
-        let refund = balance::value(&payment);
+        let refund = payment.value();
         event::emit(OrderCancelled {
             order_id: object::uid_to_inner(&id),
             owner: buyer,
@@ -307,7 +318,7 @@ module m1n3_v4::hash_share_market {
         if (refund > 0) {
             transfer::public_transfer(coin::from_balance(payment, ctx), buyer);
         } else {
-            balance::destroy_zero(payment);
+            payment.destroy_zero();
         };
     }
 
@@ -320,7 +331,7 @@ module m1n3_v4::hash_share_market {
         ctx: &mut TxContext,
     ) {
         assert!(price_per_unit_mist > 0, EPriceTooLow);
-        let inventory_units = coin::value(&inventory);
+        let inventory_units = inventory.value();
         assert!(inventory_units > 0, EZeroQty);
         let seller = tx_context::sender(ctx);
         let exp = if (expires_epoch == 0) { option::none() } else { option::some(expires_epoch) };
@@ -329,7 +340,7 @@ module m1n3_v4::hash_share_market {
             id: object::new(ctx),
             seller,
             price_per_unit_mist,
-            inventory: coin::into_balance(inventory),
+            inventory: inventory.into_balance(),
             expires_epoch: exp,
         };
         event::emit(SellOrderPlaced {
@@ -359,30 +370,30 @@ module m1n3_v4::hash_share_market {
             );
         };
         assert!(units_to_buy > 0, EZeroQty);
-        assert!(balance::value(&order.inventory) >= units_to_buy, EInsufficientHashShares);
+        assert!(order.inventory.value() >= units_to_buy, EInsufficientHashShares);
 
         let gross = mul_div(units_to_buy, order.price_per_unit_mist, 1, rounding::down()).destroy_some();
-        assert!(coin::value(&payment) >= gross, EOrderExhausted);
+        assert!(payment.value() >= gross, EOrderExhausted);
 
         let buyer = tx_context::sender(ctx);
         let fee = mul_div(gross, FEE_BPS, BPS_DENOM, rounding::down()).destroy_some();
         // Pay seller (gross - fee), admin (fee), refund any overpayment.
-        let mut payment_balance = coin::into_balance(payment);
-        let mut to_pay = balance::split(&mut payment_balance, gross);
-        let fee_balance = balance::split(&mut to_pay, fee);
+        let mut payment_balance = payment.into_balance();
+        let mut to_pay = payment_balance.split(gross);
+        let fee_balance = to_pay.split(fee);
 
         // Inventory to buyer.
-        let hashshares_out = balance::split(&mut order.inventory, units_to_buy);
+        let hashshares_out = order.inventory.split(units_to_buy);
         transfer::public_transfer(coin::from_balance(hashshares_out, ctx), buyer);
         // Net SUI to seller.
         transfer::public_transfer(coin::from_balance(to_pay, ctx), order.seller);
         // Fee direct to admin.
         transfer::public_transfer(coin::from_balance(fee_balance, ctx), fee_pool.admin);
         // Refund overpayment to buyer.
-        if (balance::value(&payment_balance) > 0) {
+        if (payment_balance.value() > 0) {
             transfer::public_transfer(coin::from_balance(payment_balance, ctx), buyer);
         } else {
-            balance::destroy_zero(payment_balance);
+            payment_balance.destroy_zero();
         };
 
         event::emit(SellOrderFilled {
@@ -391,7 +402,7 @@ module m1n3_v4::hash_share_market {
             units: units_to_buy,
             gross_mist: gross,
             fee_mist: fee,
-            inventory_remaining: balance::value(&order.inventory),
+            inventory_remaining: order.inventory.value(),
         });
     }
 
@@ -418,13 +429,13 @@ module m1n3_v4::hash_share_market {
         order: &mut SellOrder<T>,
         more_inventory: Coin<T>,
     ) {
-        balance::join(&mut order.inventory, coin::into_balance(more_inventory));
+        order.inventory.join(more_inventory.into_balance());
     }
 
     public fun cancel_sell_order<T>(order: SellOrder<T>, ctx: &mut TxContext) {
         assert!(order.seller == tx_context::sender(ctx), ENotSeller);
         let SellOrder { id, seller, price_per_unit_mist: _, inventory, expires_epoch: _ } = order;
-        let refund = balance::value(&inventory);
+        let refund = inventory.value();
         event::emit(OrderCancelled {
             order_id: object::uid_to_inner(&id),
             owner: seller,
@@ -435,7 +446,7 @@ module m1n3_v4::hash_share_market {
         if (refund > 0) {
             transfer::public_transfer(coin::from_balance(inventory, ctx), seller);
         } else {
-            balance::destroy_zero(inventory);
+            inventory.destroy_zero();
         };
     }
 
@@ -446,7 +457,7 @@ module m1n3_v4::hash_share_market {
             ENotExpired,
         );
         let SellOrder { id, seller, price_per_unit_mist: _, inventory, expires_epoch: _ } = order;
-        let refund = balance::value(&inventory);
+        let refund = inventory.value();
         event::emit(OrderCancelled {
             order_id: object::uid_to_inner(&id),
             owner: seller,
@@ -457,7 +468,7 @@ module m1n3_v4::hash_share_market {
         if (refund > 0) {
             transfer::public_transfer(coin::from_balance(inventory, ctx), seller);
         } else {
-            balance::destroy_zero(inventory);
+            inventory.destroy_zero();
         };
     }
 
@@ -505,12 +516,12 @@ module m1n3_v4::hash_share_market {
 
     public fun buy_buyer<T>(o: &BuyOrder<T>): address { o.buyer }
     public fun buy_price<T>(o: &BuyOrder<T>): u64 { o.price_per_unit_mist }
-    public fun buy_budget<T>(o: &BuyOrder<T>): u64 { balance::value(&o.payment) }
+    public fun buy_budget<T>(o: &BuyOrder<T>): u64 { o.payment.value() }
     public fun buy_expires<T>(o: &BuyOrder<T>): Option<u64> { o.expires_epoch }
 
     public fun sell_seller<T>(o: &SellOrder<T>): address { o.seller }
     public fun sell_price<T>(o: &SellOrder<T>): u64 { o.price_per_unit_mist }
-    public fun sell_inventory<T>(o: &SellOrder<T>): u64 { balance::value(&o.inventory) }
+    public fun sell_inventory<T>(o: &SellOrder<T>): u64 { o.inventory.value() }
     public fun sell_expires<T>(o: &SellOrder<T>): Option<u64> { o.expires_epoch }
 
     public fun fee_pool_admin(fp: &MarketFeePool): address { fp.admin }

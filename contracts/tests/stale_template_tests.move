@@ -101,7 +101,7 @@ module m1n3_v4::stale_template_tests {
     // The ratchet must advance min_height to the submitted template's height
     // and allow equal-height re-submissions.
     #[test]
-    fun test_ratchet_advances_and_allows_equal_height() {
+    fun ratchet_advances_and_allows_equal_height() {
         let mut sc = ts::begin(MINER);
         init_registry_for(&mut sc, MINER);
         ts::next_tx(&mut sc, MINER);
@@ -137,7 +137,7 @@ module m1n3_v4::stale_template_tests {
     // After submitting at height 200, going back to height 100 must abort.
     #[test]
     #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)]
-    fun test_ratchet_blocks_height_regression() {
+    fun ratchet_blocks_height_regression() {
         let mut sc = ts::begin(MINER);
         init_registry_for(&mut sc, MINER);
         ts::next_tx(&mut sc, MINER);
@@ -166,7 +166,7 @@ module m1n3_v4::stale_template_tests {
     // even before any share has been submitted (the anchor fires on first attempt).
     #[test]
     #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)]
-    fun test_mrs_anchor_blocks_first_share_at_stale_height() {
+    fun mrs_anchor_blocks_first_share_at_stale_height() {
         let mut sc = ts::begin(MINER);
         init_registry_for(&mut sc, MINER);
         ts::next_tx(&mut sc, MINER);
@@ -197,7 +197,7 @@ module m1n3_v4::stale_template_tests {
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fun test_pool_height_advances_on_register_template() {
+    fun pool_height_advances_on_register_template() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -222,7 +222,7 @@ module m1n3_v4::stale_template_tests {
 
     // Registering a lower-height template must not regress pool.current_height.
     #[test]
-    fun test_pool_height_does_not_regress() {
+    fun pool_height_does_not_regress() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -245,7 +245,7 @@ module m1n3_v4::stale_template_tests {
 
     // Happy path: single template, MRS anchored correctly, one share accepted.
     #[test]
-    fun test_submit_share_happy_path() {
+    fun submit_share_happy_path() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_at(&mut sc, 800000);
@@ -301,7 +301,7 @@ module m1n3_v4::stale_template_tests {
     // submit_share must abort with EStaleTemplate.
     #[test]
     #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)]
-    fun test_submit_share_fails_when_mrs_anchor_exceeds_template_height() {
+    fun submit_share_fails_when_mrs_anchor_exceeds_template_height() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         // Only one template, at height 800000.
@@ -349,7 +349,7 @@ module m1n3_v4::stale_template_tests {
     // submission at height 800000 — verified end-to-end through submit_share.
     #[test]
     #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)]
-    fun test_submit_share_ratchet_blocks_old_template_after_new_share() {
+    fun submit_share_ratchet_blocks_old_template_after_new_share() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 

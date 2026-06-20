@@ -15,15 +15,20 @@ module m1n3_v4::miner {
 
     // ── Error codes ───────────────────────────────────────────────────────────
 
-    const ENotOwner: u64 = 11;
-    const ERoundMismatch: u64 = 20;
-    const EMinerMismatch: u64 = 21;
-    const EStaleTemplate: u64 = 22;
+    #[error]
+    const ENotOwner: vector<u8> = b"Caller is not the owner of these MinerStats";
+    #[error]
+    const ERoundMismatch: vector<u8> = b"MinerRoundStats round_id does not match the share's round_id";
+    #[error]
+    const EMinerMismatch: vector<u8> = b"MinerRoundStats belongs to a different miner";
+    #[error]
+    const EStaleTemplate: vector<u8> = b"Template's round_id is older than pool.current_round; share rejected";
     /// `create_round_stats` called twice for the same (miner, round) pair.
     /// This dedup is what lets `hashi_rewards::claim_reward` drop its own
     /// `claimed` table — one MRS per round means one MinerWorkRecord per
     /// round means consumption-by-value is sufficient dedup at claim time.
-    const EDuplicateRoundStats: u64 = 23;
+    #[error]
+    const EDuplicateRoundStats: vector<u8> = b"A MinerRoundStats already exists for this (miner, round) pair";
 
     // ── Round-stats uniqueness registry ───────────────────────────────────────
 

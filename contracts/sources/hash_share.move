@@ -47,15 +47,24 @@ module m1n3_v4::hash_share {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const EWrongCap: u64 = 1;
-    const ERoundMismatch: u64 = 2;
-    const EDepositNotConfirmed: u64 = 3;
-    const EZeroBalance: u64 = 4;
-    const EZeroSupply: u64 = 5;
-    const EZeroAmount: u64 = 6;
-    const EWindowNotPassed: u64 = 7;
-    const EAlreadyExpired: u64 = 8;
-    const ERedemptionAlreadyOpen: u64 = 9;
+    #[error]
+    const EWrongCap: vector<u8> = b"Provided TreasuryCap does not match the round's bound HashShare slot";
+    #[error]
+    const ERoundMismatch: vector<u8> = b"BlockDepositRecord round_id does not match the RoundHistory";
+    #[error]
+    const EDepositNotConfirmed: vector<u8> = b"BlockDepositRecord has not been CONFIRMED by the Hashi committee";
+    #[error]
+    const EZeroBalance: vector<u8> = b"Deposit record amount_sats is zero; nothing to seed the redemption with";
+    #[error]
+    const EZeroSupply: vector<u8> = b"HashShare supply is zero; cannot open a redemption against an empty round";
+    #[error]
+    const EZeroAmount: vector<u8> = b"Burn amount must be greater than zero";
+    #[error]
+    const EWindowNotPassed: vector<u8> = b"Redemption window has not expired yet";
+    #[error]
+    const EAlreadyExpired: vector<u8> = b"Redemption has already expired and been recycled";
+    #[error]
+    const ERedemptionAlreadyOpen: vector<u8> = b"A Redemption already exists for this round";
 
     // ── Structs ───────────────────────────────────────────────────────────────
 

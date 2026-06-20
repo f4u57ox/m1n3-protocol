@@ -70,6 +70,16 @@ waiting for the round to close. The keeper auto-creates a
 production-grade on-chain CLOB on Sui. Miners get real liquidity
 day-one; we get to skip implementing an order book.
 
+**Deferred — dapp-kit-react migration.** The
+[`MystenLabs/skills`](https://github.com/MystenLabs/skills) `frontend-apps`
+skill flags `@mysten/dapp-kit` (no suffix) as deprecated in favour of
+`@mysten/dapp-kit-react` / `@mysten/dapp-kit-core` with the new
+`createDAppKit` factory pattern. We're on `@mysten/dapp-kit@1.1.1` today
+(`SuiClientProvider` / `WalletProvider` / `useCurrentAccount` /
+`useSignAndExecuteTransaction`), which still works but isn't the
+shape Mysten now teaches. Migration is a separate session — out of
+scope for the hackathon push, tracked for the follow-up branch.
+
 ## Hashi
 
 The MPC bridge that custodies BTC and mints hBTC on Sui. m1n3 uses

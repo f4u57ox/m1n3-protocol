@@ -113,7 +113,7 @@ module m1n3_v4::pool_core_tests {
     // ── Template registration ─────────────────────────────────────────────────
 
     #[test]
-    fun test_register_template_creates_frozen_object() {
+    fun register_template_creates_frozen_object() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -130,7 +130,7 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    fun test_register_template_requires_admin_cap() {
+    fun register_template_requires_admin_cap() {
         // Positive path — just verify it succeeds with the correct cap.
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
@@ -147,7 +147,7 @@ module m1n3_v4::pool_core_tests {
     // ── share submission ──────────────────────────────────────────────────────
 
     #[test]
-    fun test_submit_share_succeeds() {
+    fun submit_share_succeeds() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -191,7 +191,7 @@ module m1n3_v4::pool_core_tests {
     // open_round_accumulator_from_claim with no PoolAdminCap.
 
     #[test]
-    fun test_block_found_claim_opens_accumulator_without_cap() {
+    fun block_found_claim_opens_accumulator_without_cap() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -258,8 +258,8 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 2)] // EDuplicateShare from share_dedup
-    fun test_submit_duplicate_share_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::share_dedup::EDuplicateShare)]
+    fun submit_duplicate_share_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -295,8 +295,8 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 22)] // EWrongMiner (pool uses 22)
-    fun test_submit_share_wrong_miner_stats_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::pool::EWrongMiner)]
+    fun submit_share_wrong_miner_stats_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -362,8 +362,8 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 9)] // EInvalidNtime
-    fun test_submit_share_ntime_too_far_future_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::pool::EInvalidNtime)]
+    fun submit_share_ntime_too_far_future_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -394,8 +394,8 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 8)] // EInvalidVersionRolling
-    fun test_submit_share_bad_version_bits_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::pool::EInvalidVersionRolling)]
+    fun submit_share_bad_version_bits_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -431,8 +431,8 @@ module m1n3_v4::pool_core_tests {
     // submitting the same share hash to two separate dedup objects is closed.
 
     #[test]
-    #[expected_failure(abort_code = 3)] // EAlreadyRegistered from share_dedup
-    fun test_c1_same_hash_accepted_by_two_separate_dedups() {
+    #[expected_failure(abort_code = m1n3_v4::share_dedup::EAlreadyRegistered)]
+    fun c1_same_hash_accepted_by_two_separate_dedups() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
         register_template(&mut sc);
@@ -461,7 +461,7 @@ module m1n3_v4::pool_core_tests {
     // ── Round accumulation ────────────────────────────────────────────────────
 
     #[test]
-    fun test_open_round_accumulator_from_claim_idempotent() {
+    fun open_round_accumulator_from_claim_idempotent() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -493,8 +493,8 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 24)] // EAccumulationWindowOpen
-    fun test_finalize_round_before_window_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::pool::EAccumulationWindowOpen)]
+    fun finalize_round_before_window_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -514,7 +514,7 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    fun test_finalize_round_advances_current_round() {
+    fun finalize_round_advances_current_round() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -536,7 +536,7 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
-    fun test_accumulate_miner_stats_produces_work_record() {
+    fun accumulate_miner_stats_produces_work_record() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 
@@ -589,8 +589,8 @@ module m1n3_v4::pool_core_tests {
     // `test_accumulate_miner_stats_other_miner_aborts` below.
 
     #[test]
-    #[expected_failure(abort_code = 22)] // EWrongMiner
-    fun test_accumulate_miner_stats_other_miner_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::pool::EWrongMiner)]
+    fun accumulate_miner_stats_other_miner_aborts() {
         let mut sc = ts::begin(ADMIN);
         setup(&mut sc);
 

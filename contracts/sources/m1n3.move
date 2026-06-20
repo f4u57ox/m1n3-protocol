@@ -4,7 +4,8 @@ module m1n3_v4::m1n3 {
     use m1n3_v4::pool::{Self, Pool};
 
     // ======== Error Codes ========
-    const ENotAdmin: u64 = 0;
+    #[error]
+    const ENotAdmin: vector<u8> = b"Caller is not the pool admin";
 
     /// One-Time-Witness for the M1N3 coin
     public struct M1N3 has drop {}
@@ -55,7 +56,11 @@ module m1n3_v4::m1n3 {
     /// Admin-only mint for testing and airdrops.
     /// Authorized by the Pool admin address (deployer).
     /// In production, remove or gate behind governance.
-    public entry fun admin_mint_for_testing(
+    ///
+    /// Intentionally `entry` (no `public`) per the composable-move-functions
+    /// guidance — this is a non-composable convenience endpoint that handles
+    /// the transfer itself, not a building block for PTBs.
+    entry fun admin_mint_for_testing(
         treasury: &mut M1N3Treasury,
         pool: &Pool,
         amount: u64,

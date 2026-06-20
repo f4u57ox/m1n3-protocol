@@ -10,8 +10,10 @@ module m1n3_v4::btc_math {
 
     // ===== Errors =====
 
-    const EInvalidLength: u64 = 0;
-    const EInvalidMerkleHashLength: u64 = 1;
+    #[error]
+    const EInvalidLength: vector<u8> = b"Input byte vector has the wrong length (expected 32 bytes)";
+    #[error]
+    const EInvalidMerkleHashLength: vector<u8> = b"Merkle hash must be exactly 32 bytes";
 
     // ===== Hash Functions =====
 

@@ -45,14 +45,22 @@ module m1n3_v4::pool {
 
     // ── Error codes ───────────────────────────────────────────────────────────
 
-    const EShareDoesNotMeetDifficulty: u64 = 1;
-    const ENotAdmin: u64 = 5;
-    const EInvalidVersionRolling: u64 = 8;
-    const EInvalidNtime: u64 = 9;
-    const EWrongTemplate: u64 = 21;
-    const EWrongMiner: u64 = 22;
-    const ERoundMismatch: u64 = 23;
-    const EAccumulationWindowOpen: u64 = 24;
+    #[error]
+    const EShareDoesNotMeetDifficulty: vector<u8> = b"Share hash does not meet the pool's difficulty target";
+    #[error]
+    const ENotAdmin: vector<u8> = b"Caller does not hold the PoolAdminCap";
+    #[error]
+    const EInvalidVersionRolling: vector<u8> = b"Miner-rolled version bits violate BIP-320 mask";
+    #[error]
+    const EInvalidNtime: vector<u8> = b"Share ntime is outside the allowed window (too old or too far in future)";
+    #[error]
+    const EWrongTemplate: vector<u8> = b"Share references a template that does not belong to this pool";
+    #[error]
+    const EWrongMiner: vector<u8> = b"MinerRoundStats does not belong to the transaction sender";
+    #[error]
+    const ERoundMismatch: vector<u8> = b"BlockFoundClaim round_id does not match pool.current_round";
+    #[error]
+    const EAccumulationWindowOpen: vector<u8> = b"Accumulation window is still open; finalize_round must wait";
 
     // ── Shared objects ────────────────────────────────────────────────────────
 

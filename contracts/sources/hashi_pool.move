@@ -74,12 +74,16 @@ module m1n3_v4::hashi_pool {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const EInvalidBtcAddress: u64 = 1;
-    const EInvalidTxid:       u64 = 2;
-    const EInvalidStatus:     u64 = 3;
+    #[error]
+    const EInvalidBtcAddress: vector<u8> = b"BTC address must be a valid P2WPKH (22B) or P2TR (32B) witness program";
+    #[error]
+    const EInvalidTxid: vector<u8> = b"Bitcoin txid must be exactly 32 bytes";
+    #[error]
+    const EInvalidStatus: vector<u8> = b"BlockDepositRecord is not in the required status for this operation";
     /// `mark_funded` called twice for the same `BlockDepositRecord`. Each
     /// record can fund exactly one batch; subsequent attempts abort.
-    const EAlreadyFunded:     u64 = 15;
+    #[error]
+    const EAlreadyFunded: vector<u8> = b"This BlockDepositRecord has already funded a HashiRewardBatch";
 
     // ── Structs ───────────────────────────────────────────────────────────────
 

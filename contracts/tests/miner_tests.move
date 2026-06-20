@@ -31,7 +31,7 @@ module m1n3_v4::miner_tests {
     // ── register_miner ────────────────────────────────────────────────────────
 
     #[test]
-    fun test_register_miner_creates_stats() {
+    fun register_miner_creates_stats() {
         let mut sc = ts::begin(MINER_A);
         ts::next_tx(&mut sc, MINER_A);
         {
@@ -52,7 +52,7 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    fun test_set_btc_payout_address_by_owner() {
+    fun set_btc_payout_address_by_owner() {
         let mut sc = ts::begin(MINER_A);
         ts::next_tx(&mut sc, MINER_A);
         {
@@ -71,8 +71,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 11)] // ENotOwner
-    fun test_set_btc_payout_address_non_owner_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::miner::ENotOwner)]
+    fun set_btc_payout_address_non_owner_aborts() {
         let mut sc = ts::begin(MINER_A);
         ts::next_tx(&mut sc, MINER_A);
         {
@@ -93,7 +93,7 @@ module m1n3_v4::miner_tests {
     // ── create_round_stats ────────────────────────────────────────────────────
 
     #[test]
-    fun test_create_round_stats() {
+    fun create_round_stats_succeeds() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         create_round_stats(&mut sc, MINER_A, ROUND_0, HEIGHT_100);
@@ -115,7 +115,7 @@ module m1n3_v4::miner_tests {
     // These test the invariants exposed by public accessors.
 
     #[test]
-    fun test_record_share_accumulates_work() {
+    fun record_share_accumulates_work() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         ts::next_tx(&mut sc, MINER_A);
@@ -147,8 +147,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 20)] // ERoundMismatch
-    fun test_record_share_wrong_round_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::miner::ERoundMismatch)]
+    fun record_share_wrong_round_aborts() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         ts::next_tx(&mut sc, MINER_A);
@@ -171,8 +171,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 22)] // EStaleTemplate
-    fun test_record_share_stale_height_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)]
+    fun record_share_stale_height_aborts() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         ts::next_tx(&mut sc, MINER_A);
@@ -196,7 +196,7 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    fun test_min_height_ratchet() {
+    fun min_height_ratchet() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         ts::next_tx(&mut sc, MINER_A);
@@ -222,8 +222,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 22)] // EStaleTemplate after ratchet
-    fun test_min_height_ratchet_prevents_backwards() {
+    #[expected_failure(abort_code = m1n3_v4::miner::EStaleTemplate)] // after ratchet
+    fun min_height_ratchet_prevents_backwards() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         ts::next_tx(&mut sc, MINER_A);
@@ -250,7 +250,7 @@ module m1n3_v4::miner_tests {
     // ── sold_work deduction ───────────────────────────────────────────────────
 
     #[test]
-    fun test_sold_work_deduction() {
+    fun sold_work_deduction() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         create_round_stats(&mut sc, MINER_A, ROUND_0, HEIGHT_100);
@@ -266,8 +266,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 20)] // ERoundMismatch
-    fun test_sold_work_wrong_round_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::miner::ERoundMismatch)]
+    fun sold_work_wrong_round_aborts() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         create_round_stats(&mut sc, MINER_A, ROUND_0, HEIGHT_100);
@@ -283,7 +283,7 @@ module m1n3_v4::miner_tests {
     // ── close_miner_round_stats ───────────────────────────────────────────────
 
     #[test]
-    fun test_close_miner_round_stats_by_owner() {
+    fun close_miner_round_stats_by_owner() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         create_round_stats(&mut sc, MINER_A, ROUND_0, HEIGHT_100);
@@ -296,8 +296,8 @@ module m1n3_v4::miner_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = 11)] // ENotOwner
-    fun test_close_miner_round_stats_non_owner_aborts() {
+    #[expected_failure(abort_code = m1n3_v4::miner::ENotOwner)]
+    fun close_miner_round_stats_non_owner_aborts() {
         let mut sc = ts::begin(MINER_A);
         init_registry(&mut sc, MINER_A);
         create_round_stats(&mut sc, MINER_A, ROUND_0, HEIGHT_100);

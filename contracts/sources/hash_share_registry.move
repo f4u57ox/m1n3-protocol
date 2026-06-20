@@ -46,10 +46,14 @@ module m1n3_v4::hash_share_registry {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const ENoAvailableSlots: u64 = 1;
-    const ESlotAlreadyRegistered: u64 = 2;
-    const EWrongCap: u64 = 3;
-    const EFeeTooHigh: u64 = 4;
+    #[error]
+    const ENoAvailableSlots: vector<u8> = b"No HashShare slots available — publish more hs_NNN packages and call register_slot";
+    #[error]
+    const ESlotAlreadyRegistered: vector<u8> = b"This TreasuryCap has already been registered into the slot buffer";
+    #[error]
+    const EWrongCap: vector<u8> = b"The provided TreasuryCap does not match the round's bound slot";
+    #[error]
+    const EFeeTooHigh: vector<u8> = b"Fee bps exceeds the protocol cap (MAX_FEE_BPS)";
 
     // ── Structs ───────────────────────────────────────────────────────────────
 

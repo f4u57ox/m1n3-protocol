@@ -39,14 +39,22 @@ module m1n3_v4::hashi_rewards {
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    const EInvalidStatus: u64 = 2;
-    const EClaimDeadlinePassed: u64 = 8;
-    const EDeadlineNotReached: u64 = 9;
-    const ERoundMismatch: u64 = 10;
-    const EZeroWork: u64 = 11;
-    const EWrongMiner: u64 = 12;
-    const EDepositNotConfirmed: u64 = 13;
-    const EZeroBalance: u64 = 14;
+    #[error]
+    const EInvalidStatus: vector<u8> = b"HashiRewardBatch is not in the required status for this operation";
+    #[error]
+    const EClaimDeadlinePassed: vector<u8> = b"Claim deadline has passed; this batch can only be recycled now";
+    #[error]
+    const EDeadlineNotReached: vector<u8> = b"Claim deadline has not been reached; recycle is not yet allowed";
+    #[error]
+    const ERoundMismatch: vector<u8> = b"BlockDepositRecord round_id does not match the RoundHistory or batch";
+    #[error]
+    const EZeroWork: vector<u8> = b"Round total_net_work is zero; nothing to distribute";
+    #[error]
+    const EWrongMiner: vector<u8> = b"MinerWorkRecord belongs to a different miner than the tx sender";
+    #[error]
+    const EDepositNotConfirmed: vector<u8> = b"BlockDepositRecord has not been CONFIRMED by the Hashi committee";
+    #[error]
+    const EZeroBalance: vector<u8> = b"Deposit record amount_sats is zero";
 
     /// Default claim window for the trustless funding path: 30 days. Fixed
     /// (not operator-chosen) so a malicious caller can't squeeze the window.
@@ -194,7 +202,7 @@ module m1n3_v4::hashi_rewards {
             claim_deadline_ms: now + TRUSTLESS_CLAIM_WINDOW_MS,
             completed_at_ms: option::none(),
         };
-        balance::join(&mut batch.balance, drained);
+        batch.balance.join(drained);
 
         registry.total_batches = registry.total_batches + 1;
         let batch_id = object::uid_to_address(&batch.id);
@@ -228,11 +236,11 @@ module m1n3_v4::hashi_rewards {
         assert!(batch.status == STATUS_FUNDED, EInvalidStatus);
         assert!(clock::timestamp_ms(clock) >= batch.claim_deadline_ms, EDeadlineNotReached);
 
-        let reclaimed = balance::value(&batch.balance);
+        let reclaimed = batch.balance.value();
         let claimed_sats = batch.claimed_sats;
 
         if (reclaimed > 0) {
-            let bal = balance::split(&mut batch.balance, reclaimed);
+            let bal = batch.balance.split(reclaimed);
             hashi_vault::deposit_hbtc<CoinType>(vault, bal);
         };
 
@@ -292,7 +300,7 @@ module m1n3_v4::hashi_rewards {
 
         batch.claimed_sats = batch.claimed_sats + amount;
 
-        let reward = coin::from_balance(balance::split(&mut batch.balance, amount), ctx);
+        let reward = coin::from_balance(batch.balance.split(amount), ctx);
         transfer::public_transfer(reward, miner);
 
         event::emit(HashiRewardClaimed {
@@ -303,7 +311,7 @@ module m1n3_v4::hashi_rewards {
         });
 
         // If balance is fully drained, mark complete.
-        if (balance::value(&batch.balance) == 0) {
+        if (batch.balance.value() == 0) {
             let now = clock::timestamp_ms(clock);
             batch.status = STATUS_COMPLETED;
             batch.completed_at_ms = option::some(now);
@@ -323,7 +331,7 @@ module m1n3_v4::hashi_rewards {
     public fun get_batch_round_id<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { batch.round_id }
     public fun get_batch_total_sats<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { batch.total_sats }
     public fun get_batch_claimed_sats<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { batch.claimed_sats }
-    public fun get_batch_balance<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { balance::value(&batch.balance) }
+    public fun get_batch_balance<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { batch.balance.value() }
     public fun get_claim_deadline<CoinType>(batch: &HashiRewardBatch<CoinType>): u64 { batch.claim_deadline_ms }
     public fun get_registry_stats(registry: &HashiRewardRegistry): (u64, u128, u128) {
         (registry.total_batches, registry.total_sats_distributed, registry.total_sats_expired)
