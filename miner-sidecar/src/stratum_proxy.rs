@@ -1,0 +1,398 @@
+//! Stratum v1 proxy: intercepts mining.submit results and submits accepted
+//! shares directly to Sui using the miner's own keypair.
+
+use std::{collections::HashMap, time::Duration};
+
+use anyhow::Result;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    time::interval,
+};
+use tracing::{info, warn};
+
+use crate::{
+    sui_sender::{PendingShare, SuiSender},
+    Args,
+};
+use sui_client::HashShareMintConfig;
+
+pub async fn run(args: Args) -> Result<()> {
+    let mut sender = SuiSender::new(
+        &args.sui_package,
+        &args.pool_object,
+        &args.dedup_registry,
+        &args.sui_rpc,
+        &args.sui_keystore,
+        args.gas_budget,
+    ).await?;
+
+    if let Some(mrr) = args.miner_round_registry.as_deref() {
+        sender = sender.with_miner_round_registry(mrr)?;
+        info!("MinerRoundRegistry wired: {}", mrr);
+    }
+
+    // Initial HashShare config (optional). The slot watcher below may
+    // overwrite it as soon as the next `SlotBoundToRound` lands.
+    if let (Some(reg), Some(cap), Some(ty)) = (
+        args.hashshare_registry.as_deref(),
+        args.hashshare_treasury_cap.as_deref(),
+        args.hashshare_type.as_deref(),
+    ) {
+        let cfg = HashShareMintConfig::from_strings(reg, cap, ty)?;
+        info!(
+            "HashShare mint enabled (initial config) — registry={} cap={} type={}",
+            cfg.registry_id, cfg.treasury_cap_id, ty
+        );
+        sender = sender.with_hashshare_mint(cfg);
+    }
+
+    // Optional auto-sell. Activates only when --auto-sell-price-mist > 0.
+    if args.auto_sell_price_mist > 0 {
+        let asc = sui_client::AutoSellConfig {
+            price_per_unit_mist: args.auto_sell_price_mist,
+            expires_at_ms: args.auto_sell_expires_ms,
+        };
+        info!(
+            "Auto-sell enabled — floor={} MIST/unit, expires_ms={}",
+            asc.price_per_unit_mist, asc.expires_at_ms,
+        );
+        sender = sender.with_auto_sell(asc);
+    }
+
+    let (cfg_tx, cfg_rx) = mpsc::unbounded_channel::<HashShareMintConfig>();
+
+    if let Some(reg) = args.hashshare_registry.clone() {
+        let rpc = args.sui_rpc.clone();
+        let pkg = args.sui_package.clone();
+        let poll = args.slot_poll_seconds;
+        info!(
+            "Slot-bound watcher starting — registry={} poll_secs={}",
+            reg, poll
+        );
+        tokio::spawn(async move {
+            if let Err(e) = crate::slot_watcher::run(rpc, pkg, reg, poll, cfg_tx).await {
+                warn!("Slot watcher exited: {:?}", e);
+            }
+        });
+    } else {
+        info!("HashShare mint disabled (no --hashshare-registry).");
+    }
+
+    let (share_tx, share_rx) = mpsc::unbounded_channel::<(String, PendingShare)>();
+
+    tokio::spawn(batch_flusher(
+        sender,
+        share_rx,
+        cfg_rx,
+        args.batch_size,
+        args.batch_timeout_ms,
+    ));
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", args.listen_port)).await?;
+    info!("Listening on 0.0.0.0:{}", args.listen_port);
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        info!("Miner connected: {}", addr);
+        let tx = share_tx.clone();
+        let host = args.stratum_host.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, host, tx).await {
+                warn!("Connection closed: {}", e);
+            }
+        });
+    }
+}
+
+// ── Batch flusher ─────────────────────────────────────────────────────────────
+
+async fn batch_flusher(
+    mut sender: SuiSender,
+    mut rx: mpsc::UnboundedReceiver<(String, PendingShare)>,
+    mut cfg_rx: mpsc::UnboundedReceiver<HashShareMintConfig>,
+    batch_size: usize,
+    batch_timeout_ms: u64,
+) {
+    let mut batch: Vec<(String, PendingShare)> = Vec::new();
+    let mut ticker = interval(Duration::from_millis(batch_timeout_ms));
+    ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            cfg = cfg_rx.recv() => {
+                match cfg {
+                    Some(cfg) => {
+                        info!(
+                            "Applied refreshed HashShare config — cap={}",
+                            cfg.treasury_cap_id
+                        );
+                        sender.set_hashshare_mint(cfg);
+                    }
+                    None => {} // watcher dropped — keep running with last cfg
+                }
+            }
+            item = rx.recv() => {
+                match item {
+                    None => { flush(&mut sender, &mut batch).await; break; }
+                    Some(item) => {
+                        batch.push(item);
+                        if batch.len() >= batch_size {
+                            flush(&mut sender, &mut batch).await;
+                        }
+                    }
+                }
+            }
+            _ = ticker.tick() => flush(&mut sender, &mut batch).await,
+        }
+    }
+}
+
+async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) {
+    if batch.is_empty() {
+        return;
+    }
+    let items: Vec<(String, PendingShare)> = batch.drain(..).collect();
+    let n = items.len();
+    match sender.submit_batch(&items).await {
+        Ok(digest) => {
+            info!("Batch of {} share(s) confirmed: {}", n, digest);
+            // Auto-sell pass — no-op when --auto-sell-price-mist is 0 or the
+            // wallet holds no HashShares of the active slot.
+            match sender.auto_sell_minted().await {
+                Ok(Some(label)) => info!("Auto-sell placed: {}", label),
+                Ok(None) => {}
+                Err(e) => warn!("Auto-sell failed: {}", e),
+            }
+        }
+        Err(e) => warn!("Batch submission failed: {}", e),
+    }
+}
+
+// ── Per-connection proxy ───────────────────────────────────────────────────────
+
+async fn handle_connection(
+    downstream: TcpStream,
+    stratum_host: String,
+    share_tx: mpsc::UnboundedSender<(String, PendingShare)>,
+) -> Result<()> {
+    let upstream = TcpStream::connect(&stratum_host).await?;
+    info!("Connected upstream: {}", stratum_host);
+
+    let (ds_rd, mut ds_wr) = downstream.into_split();
+    let (us_rd, mut us_wr) = upstream.into_split();
+
+    let mut ds_lines = BufReader::new(ds_rd).lines();
+    let mut us_lines = BufReader::new(us_rd).lines();
+
+    // Per-job state: job_id → (template_id, template_version).
+    // The miner mines against whatever job_id was current at the time it
+    // started hashing; we must use THAT job's metadata when submitting to Sui,
+    // not the latest notify (which may have rolled while the miner was still
+    // working on the older job).
+    let mut jobs: HashMap<String, (String, u32)> = HashMap::new();
+    // Extranonce1 assigned by upstream in the mining.subscribe response.
+    // Must be passed back to Sui so on-chain coinbase reconstruction matches
+    // the share hash the miner actually solved.
+    let mut extranonce1: Vec<u8> = Vec::new();
+    // Subscribe request id pending an upstream response.
+    let mut subscribe_id: Option<u64> = None;
+    // pending submit requests: id → (job_id, captured share data)
+    let mut pending: HashMap<u64, (String, PendingShare)> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            // ── Downstream → upstream ─────────────────────────────────────
+            line = ds_lines.next_line() => {
+                let line = match line? {
+                    Some(l) => l,
+                    None => break,
+                };
+                if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+                    track_subscribe_request(&msg, &mut subscribe_id);
+                    intercept_submit_request(&msg, &mut pending, &jobs, &extranonce1);
+                }
+                us_wr.write_all(line.as_bytes()).await?;
+                us_wr.write_all(b"\n").await?;
+            }
+
+            // ── Upstream → downstream ─────────────────────────────────────
+            line = us_lines.next_line() => {
+                let line = match line? {
+                    Some(l) => l,
+                    None => break,
+                };
+                if let Ok(msg) = serde_json::from_str::<Value>(&line) {
+                    intercept_upstream(
+                        &msg,
+                        &mut jobs,
+                        &mut subscribe_id,
+                        &mut extranonce1,
+                        &mut pending,
+                        &share_tx,
+                    );
+                }
+                ds_wr.write_all(line.as_bytes()).await?;
+                ds_wr.write_all(b"\n").await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Capture share data from `mining.submit` before forwarding upstream.
+/// `jobs` maps job_id → (template_id, template_version); we use the share's
+/// own job_id (params[1]) to pick the right template, since the miner may
+/// have submitted a share for an older job than the latest notify.
+fn intercept_submit_request(
+    msg: &Value,
+    pending: &mut HashMap<u64, (String, PendingShare)>,
+    jobs: &HashMap<String, (String, u32)>,
+    extranonce1: &[u8],
+) {
+    if msg.get("method").and_then(Value::as_str) != Some("mining.submit") {
+        return;
+    }
+    let id = match msg.get("id").and_then(Value::as_u64) {
+        Some(id) => id,
+        None => return,
+    };
+    let params = match msg.get("params").and_then(Value::as_array) {
+        Some(p) => p,
+        None => return,
+    };
+    // params[1] is the job_id the miner solved against.
+    let job_id = match params.get(1).and_then(Value::as_str) {
+        Some(j) => j.to_string(),
+        None => return,
+    };
+    let template_version = jobs.get(&job_id).map(|(_, v)| *v).unwrap_or(0);
+
+    if let Some(mut share) = parse_submit_params(params) {
+        // BIP320: actual block version =
+        //   (template.version & !MASK) | (miner_bits & MASK)
+        // Plain OR would conflate the template's own bits inside the mask with
+        // the miner's, producing a different hash than the miner actually used.
+        const VERSION_ROLLING_MASK: u32 = 0x1fffe000;
+        share.version = (template_version & !VERSION_ROLLING_MASK)
+            | (share.version & VERSION_ROLLING_MASK);
+        share.extranonce1 = extranonce1.to_vec();
+        pending.insert(id, (job_id, share));
+    }
+}
+
+/// Watch for an outgoing mining.subscribe request so we know which upstream
+/// response will carry the extranonce1 assignment.
+fn track_subscribe_request(msg: &Value, subscribe_id: &mut Option<u64>) {
+    if msg.get("method").and_then(Value::as_str) == Some("mining.subscribe") {
+        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+            *subscribe_id = Some(id);
+        }
+    }
+}
+
+/// Handle upstream messages: capture per-job template metadata from notify, queue shares on accept.
+fn intercept_upstream(
+    msg: &Value,
+    jobs: &mut HashMap<String, (String, u32)>,
+    subscribe_id: &mut Option<u64>,
+    extranonce1: &mut Vec<u8>,
+    pending: &mut HashMap<u64, (String, PendingShare)>,
+    share_tx: &mpsc::UnboundedSender<(String, PendingShare)>,
+) {
+    let method = msg.get("method").and_then(Value::as_str);
+
+    if method == Some("mining.set_extranonce") {
+        // Some pools (including m1n3's stratum-server) replace extranonce1
+        // post-authorize — typically derived from the miner's blockchain
+        // address. We must track the latest value so on-chain coinbase
+        // reconstruction matches what the miner is currently hashing with.
+        if let Some(params) = msg.get("params").and_then(Value::as_array) {
+            if let Some(en1_hex) = params.get(0).and_then(Value::as_str) {
+                if let Ok(bytes) = hex::decode(en1_hex) {
+                    *extranonce1 = bytes;
+                    info!("Updated extranonce1 from mining.set_extranonce: {}", en1_hex);
+                }
+            }
+        }
+        return;
+    }
+
+    if method == Some("mining.notify") {
+        // mining.notify params:
+        //   [0] job_id, [1] prev_hash, [2] coinbase1, [3] coinbase2,
+        //   [4] merkle_branches, [5] version, [6] nbits, [7] ntime,
+        //   [8] clean_jobs, [9] template_pda (non-standard m1n3 extension)
+        if let Some(params) = msg.get("params").and_then(Value::as_array) {
+            let job_id = params.get(0).and_then(Value::as_str).unwrap_or("").to_string();
+            let template_id = params.get(9).and_then(Value::as_str).unwrap_or("").to_string();
+            let version = params
+                .get(5)
+                .and_then(Value::as_str)
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                .unwrap_or(0);
+            let clean_jobs = params.get(8).and_then(Value::as_bool).unwrap_or(false);
+            if !job_id.is_empty() && !template_id.is_empty() {
+                if clean_jobs {
+                    jobs.clear();
+                }
+                jobs.insert(job_id, (template_id, version));
+            }
+        }
+        return;
+    }
+
+    // Response to a previously tracked submit (or subscribe)
+    let id = match msg.get("id").and_then(Value::as_u64) {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Subscribe response: result is [[<subs>], extranonce1_hex, extranonce2_size]
+    if Some(id) == *subscribe_id {
+        if let Some(arr) = msg.get("result").and_then(Value::as_array) {
+            if let Some(en1_hex) = arr.get(1).and_then(Value::as_str) {
+                if let Ok(bytes) = hex::decode(en1_hex) {
+                    *extranonce1 = bytes;
+                    info!("Captured extranonce1 from upstream: {}", en1_hex);
+                }
+            }
+        }
+        *subscribe_id = None;
+        return;
+    }
+
+    let (job_id, share) = match pending.remove(&id) {
+        Some(p) => p,
+        None => return,
+    };
+    let accepted = msg.get("result").and_then(Value::as_bool).unwrap_or(false);
+    if !accepted {
+        return;
+    }
+    match jobs.get(&job_id) {
+        Some((tid, _)) => {
+            let _ = share_tx.send((tid.clone(), share));
+        }
+        None => warn!("Share accepted for job {} but template_id not tracked — dropped", job_id),
+    }
+}
+
+/// Parse Stratum v1 `mining.submit` params into a `PendingShare`.
+///
+/// params: [worker, job_id, extranonce2_hex, ntime_hex, nonce_hex, ?version_bits_hex]
+fn parse_submit_params(params: &[Value]) -> Option<PendingShare> {
+    let extranonce2 = hex::decode(params.get(2)?.as_str()?).ok()?;
+    let ntime = u32::from_str_radix(params.get(3)?.as_str()?, 16).ok()?;
+    let nonce = u32::from_str_radix(params.get(4)?.as_str()?, 16).ok()?;
+    let version = params
+        .get(5)
+        .and_then(Value::as_str)
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    Some(PendingShare { extranonce1: vec![], extranonce2, ntime, nonce, version })
+}

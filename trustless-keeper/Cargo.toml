@@ -1,0 +1,16 @@
+[package]
+name = "trustless-keeper"
+version = "0.1.0"
+edition = "2021"
+description = "Permissionless keeper bot for m1n3: watches BlockFound and BlockDepositConfirmed events and triggers the trustless round-close + reward-funding pipeline. Anyone can run it; it holds no privileged keys, only gas."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,38 @@
+[package]
+name = "hashi-derive"
+version = "0.1.0"
+edition = "2021"
+description = "Reproduces Hashi's per-Sui-address Bitcoin P2TR derivation (BIP-341 Taproot, BIP-340 Schnorr, threshold-Schnorr child key) so we can compute the deposit address for our HashiVault without depending on the heavy hashi-types crate."
+
+[dependencies]
+anyhow = { workspace = true }
+hex = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+sha3 = "0.10"
+hkdf = "0.12"
+secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
+bitcoin = { version = "0.32", features = ["secp-recovery", "rand-std"] }
+miniscript = "13"
+
+# arkworks deserialisation — the on-chain Hashi master-G is serialised by
+# fastcrypto via arkworks `CanonicalSerialize` (LE x + flag byte), not SEC1.
+ark-secp256k1 = "0.4"
+ark-ec = "0.4"
+ark-ff = "0.4"
+ark-serialize = "0.4"
+num-bigint = "0.4"
+
+ureq = { version = "2", features = ["json"] }
+serde = { workspace = true }
+
+[[bin]]
+name = "hashi-derive-address"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen-signet-wallet"
+path = "src/bin/gen_signet_wallet.rs"
+
+[[bin]]
+name = "signet-deposit"
+path = "src/bin/signet_deposit.rs"

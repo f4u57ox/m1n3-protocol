@@ -1,0 +1,22 @@
+[package]
+name = "miner-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "m1n3 miner sidecar — trustless Stratum v1 proxy that submits shares directly to Sui using the miner's own keypair"
+
+[dependencies]
+sui-client = { path = "../sui-client" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = { workspace = true }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[bin]]
+name = "miner-sidecar"
+path = "src/main.rs"

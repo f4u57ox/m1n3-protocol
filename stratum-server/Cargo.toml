@@ -1,0 +1,27 @@
+[package]
+name = "stratum-server"
+version = "0.2.0"
+edition = "2021"
+description = "m1n3 Stratum v1 server — connects miners to the Sui pool"
+
+[dependencies]
+sui-sdk    = { workspace = true }
+sui-client = { path = "../sui-client" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+sha2 = "0.10"
+bs58 = "0.5"
+reqwest = { version = "0.11", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+rand = "0.8"
+
+[[bin]]
+name = "stratum-server"
+path = "src/main.rs"
