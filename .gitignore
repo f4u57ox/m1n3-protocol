@@ -1,14 +1,41 @@
 # Rust
 target/
-Cargo.lock
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+web/node_modules/
+web/.next/
+web/out/
+web/data/block-hashes.json
+web/public/data/block-hashes/
+web/*.zip
+*.tsbuildinfo
+# Fumadocs build/source cache — regenerated on `next dev`
+web/.source/
 
 # Sui build artifacts
 contracts/build/
 contracts/.sui/
 
-# Environment
+# Environment / secrets
 .env
 *.env.local
+.env.*
+!.env.example
+Pub.*.toml
+*.key
+*.keystore
+*keypair*
+# Generated signet test wallet — contains a WIF private key
+.env.btc-signet
+# Sui CLI keystore + config (machine-local)
+.sui/
+sui_config/
+
+# Generated backups
+*.bak
 
 # OS
 .DS_Store
@@ -18,3 +45,10 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Runtime logs (may contain RPC URLs or live mining data)
+logs/
+*.log
+
+# Local-only AI tooling guidance — not part of the protocol
+CLAUDE.md
