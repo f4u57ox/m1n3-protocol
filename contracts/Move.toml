@@ -1,10 +1,17 @@
 [package]
-name = "m1n3_protocol"
+name = "m1n3_v4"
+edition = "2024"
 version = "0.1.0"
-edition = "2024.beta"
 
 [dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/mainnet", override = true }
+MoveStdlib = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/move-stdlib", rev = "framework/mainnet", override = true }
+openzeppelin_math = { git = "https://github.com/OpenZeppelin/contracts-sui.git", subdir = "math/core", rev = "v1.3.0" }
 
 [addresses]
-m1n3_protocol = "0x0"
+m1n3_v4 = "0x0"
+
+[environments]
+devnet = "5ea2c653"
+local = "5a7c37c8"
+testnet = "4c78adac"
