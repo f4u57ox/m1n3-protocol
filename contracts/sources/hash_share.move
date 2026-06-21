@@ -163,6 +163,22 @@ module m1n3_v4::hash_share {
         transfer::public_transfer(coin, recipient);
     }
 
+    /// Bundle factor: 1 `Coin<HS_NNN>` represents this many difficulty-1
+    /// units of work. Without bundling (factor = 1), each HS represents
+    /// 1 share of work and fair-value PPS pricing on a USDC-quoted
+    /// market sits at ~10^-9 USD per HS — below USDC's 6-decimal
+    /// resolution, so the market cannot price shares at fair value.
+    /// Bundling 10,000:1 lifts fair value into the µUSDC range so
+    /// orderbook ticks become meaningful while keeping the work
+    /// accounting precise (pool accumulator still tracks raw work).
+    ///
+    /// Truncation: when `difficulty % BUNDLE_FACTOR > 0` the dust
+    /// rounds down; the miner forfeits the residual work units' Coin
+    /// representation but the work is still credited to them in
+    /// `MinerRoundStats.sold_work` (and therefore the round
+    /// accumulator), so reward distribution stays exact.
+    const BUNDLE_FACTOR: u64 = 10_000;
+
     public fun mint_share<T>(
         registry: &HashShareRegistry,
         treasury_cap: &mut TreasuryCap<T>,
@@ -178,15 +194,20 @@ module m1n3_v4::hash_share {
         hash_share_registry::assert_cap_matches_round(registry, round_id, cap_id);
 
         // Exclusivity vs pool reward + market fill: same `sold_work` field.
+        // We pass the RAW difficulty here, not the bundled value — the
+        // pool accumulator + reward math operate in work units.
         miner::record_sold_share(miner_round_stats, miner, difficulty, round_id);
 
-        let mut all_minted = coin::mint<T>(treasury_cap, difficulty, ctx);
+        // Mint bundled Coins. Floor-divide; truncated dust is the
+        // documented tradeoff (see BUNDLE_FACTOR doc).
+        let bundled_units = difficulty / BUNDLE_FACTOR;
+        let mut all_minted = coin::mint<T>(treasury_cap, bundled_units, ctx);
 
-        // Split the protocol fee. Floor-divide; sub-bps remainders accrue
-        // to the miner. Skip the transfer entirely when fee_bps == 0 so
-        // operators can disable it via `set_fee_bps(0)`.
+        // Split the protocol fee from the BUNDLED amount. Floor-divide;
+        // sub-bps remainders accrue to the miner. Skip the transfer
+        // entirely when fee_bps == 0.
         let fee_bps = hash_share_registry::fee_bps(registry);
-        let fee_units = mul_div(difficulty, fee_bps, hash_share_registry::bps_denom(), rounding::down()).destroy_some();
+        let fee_units = mul_div(bundled_units, fee_bps, hash_share_registry::bps_denom(), rounding::down()).destroy_some();
         if (fee_units > 0) {
             let fee_coin = coin::split(&mut all_minted, fee_units, ctx);
             transfer::public_transfer(
@@ -202,6 +223,11 @@ module m1n3_v4::hash_share {
         });
         all_minted
     }
+
+    /// Public read of the bundle factor — lets off-chain consumers
+    /// (the dapp's hashprice math, the miner-sidecar's price feeder)
+    /// derive the per-Coin fair value without hardcoding the constant.
+    public fun bundle_factor(): u64 { BUNDLE_FACTOR }
 
     // ── Open redemption ──────────────────────────────────────────────────────
 

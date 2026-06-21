@@ -1,13 +1,20 @@
-/// Two-sided standing-limit market for `Coin<HASHSHARE_*>`.
+/// Two-sided standing-limit market for `Coin<HASHSHARE_*>`, generic over
+/// the quote asset.
 ///
 /// Unlike `market.move`, which can only have buyers as makers (ShareReceipts
 /// are `drop`-only and can't be escrowed by sellers), `hash_share_market` is
 /// symmetric: both sides post standing orders.
 ///
-///   `BuyOrder<T>`  — buyer escrows `Balance<SUI>`, waits for a seller to
-///                    arrive with `Coin<T>` and fill.
-///   `SellOrder<T>` — seller escrows `Balance<T>` (their HashShares), waits
-///                    for a buyer to arrive with `Coin<SUI>` and fill.
+///   `BuyOrder<T, QuoteT>`  — buyer escrows `Balance<QuoteT>`, waits for a
+///                            seller to arrive with `Coin<T>` and fill.
+///   `SellOrder<T, QuoteT>` — seller escrows `Balance<T>` (their HashShares),
+///                            waits for a buyer to arrive with `Coin<QuoteT>`
+///                            and fill.
+///
+/// The `QuoteT` type parameter lets the same module power SUI-quoted
+/// trading on testnet/devnet and native-USDC-quoted trading on mainnet.
+/// Each `(HashShare, QuoteT)` combination has its own `MarketFeePool<QuoteT>`
+/// shared object, created post-publish via `create_fee_pool<QuoteT>`.
 ///
 /// No matching engine. Each fill is a direct taker-on-maker action, one
 /// order at a time. UI surfaces best-bid / best-ask off-chain via event scan
@@ -21,14 +28,14 @@
 ///
 /// Pricing
 /// -------
-/// Both order types price in MIST per HashShare unit. A share of difficulty
-/// D produces D HashShares (1:1 mint), so `price_per_unit = MIST per
-/// difficulty unit`, mirroring `market::BuyOrder.price_per_difficulty`'s
-/// units exactly.
+/// Both order types price in base units of the quote asset per HashShare
+/// unit. For SUI quote: MIST per HashShare. For 6-decimal USDC quote:
+/// µUSDC per HashShare. A share of difficulty D produces D HashShares
+/// (1:1 mint), so `price_per_unit = quote_base_units per difficulty unit`,
+/// mirroring `market::BuyOrder.price_per_difficulty`'s units exactly.
 module m1n3_v4::hash_share_market {
     use sui::balance::{Self, Balance};
     use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
     use sui::event;
     use openzeppelin_math::u64::mul_div;
     use openzeppelin_math::rounding;
@@ -66,34 +73,39 @@ module m1n3_v4::hash_share_market {
 
     // ── Shared objects ────────────────────────────────────────────────────────
 
-    /// Admin object. Fees are routed directly to `admin` on every fill —
-    /// this object is `&`-only on the hot path, so concurrent fills don't
-    /// contend on a shared-object write here.
+    /// Admin object for a specific quote asset `QuoteT`. Fees are routed
+    /// directly to `admin` on every fill — this object is `&`-only on the
+    /// hot path, so concurrent fills don't contend on a shared-object write.
+    ///
+    /// The `balance` field is retained for compatibility with future
+    /// fee-routing experiments (e.g. flush-to-admin batching). The hot path
+    /// never writes to it.
     ///
     /// Admin transfer is two-step: the current admin calls `propose_admin`
     /// to write `pending_admin`, and the proposed address must then call
     /// `accept_admin` to take over. A typo on the new address can be
     /// rescued by the current admin re-proposing before acceptance.
-    public struct MarketFeePool has key {
+    public struct MarketFeePool<phantom QuoteT> has key {
         id: UID,
         admin: address,
         pending_admin: Option<address>,
-        balance: Balance<SUI>,
+        balance: Balance<QuoteT>,
     }
 
-    /// Standing bid for `Coin<T>`. Buyer escrows SUI; any holder of `Coin<T>`
-    /// can hit it up to budget.
-    public struct BuyOrder<phantom T> has key {
+    /// Standing bid for `Coin<T>` quoted in `QuoteT`. Buyer escrows
+    /// `QuoteT`; any holder of `Coin<T>` can hit it up to budget.
+    public struct BuyOrder<phantom T, phantom QuoteT> has key {
         id: UID,
         buyer: address,
         price_per_unit_mist: u64,
-        payment: Balance<SUI>,
+        payment: Balance<QuoteT>,
         expires_epoch: Option<u64>,
     }
 
-    /// Standing ask for `Coin<T>`. Seller escrows `Coin<T>` as inventory;
-    /// any buyer with SUI can fill up to the inventory.
-    public struct SellOrder<phantom T> has key {
+    /// Standing ask for `Coin<T>` priced in `QuoteT`. Seller escrows
+    /// `Coin<T>` as inventory; any buyer with `Coin<QuoteT>` can fill up to
+    /// the inventory.
+    public struct SellOrder<phantom T, phantom QuoteT> has key {
         id: UID,
         seller: address,
         price_per_unit_mist: u64,
@@ -165,24 +177,35 @@ module m1n3_v4::hash_share_market {
         new_admin: address,
     }
 
-    // ── Init ──────────────────────────────────────────────────────────────────
+    // ── Init / pool creation ─────────────────────────────────────────────────
 
-    fun init(ctx: &mut TxContext) {
-        transfer::share_object(MarketFeePool {
+    /// Init is a no-op. Each `(market, QuoteT)` combination has its own
+    /// `MarketFeePool<QuoteT>` shared object, created post-publish via
+    /// `create_fee_pool<QuoteT>`. This lets the same module serve both
+    /// SUI-quoted markets (testnet) and USDC-quoted markets (mainnet)
+    /// without baking the quote type into `init`'s automatic invocation.
+    fun init(_ctx: &mut TxContext) {}
+
+    /// Spin up a new `MarketFeePool<QuoteT>` for the chosen quote asset.
+    /// The sender becomes the initial admin. Permissionless on purpose:
+    /// the dapp targets a specific shared `MarketFeePool` object id, so
+    /// rogue duplicates simply sit unused.
+    public fun create_fee_pool<QuoteT>(ctx: &mut TxContext) {
+        transfer::share_object(MarketFeePool<QuoteT> {
             id: object::new(ctx),
             admin: tx_context::sender(ctx),
             pending_admin: option::none(),
-            balance: balance::zero(),
+            balance: balance::zero<QuoteT>(),
         });
     }
 
     // ── BuyOrder API ──────────────────────────────────────────────────────────
 
     /// Place a buy order. `expires_epoch = 0` means never expires.
-    public fun place_buy_order<T>(
+    public fun place_buy_order<T, QuoteT>(
         price_per_unit_mist: u64,
         expires_epoch: u64,
-        payment: Coin<SUI>,
+        payment: Coin<QuoteT>,
         ctx: &mut TxContext,
     ) {
         assert!(price_per_unit_mist > 0, EPriceTooLow);
@@ -190,7 +213,7 @@ module m1n3_v4::hash_share_market {
         let buyer = tx_context::sender(ctx);
         let exp = if (expires_epoch == 0) { option::none() } else { option::some(expires_epoch) };
 
-        let order = BuyOrder<T> {
+        let order = BuyOrder<T, QuoteT> {
             id: object::new(ctx),
             buyer,
             price_per_unit_mist,
@@ -207,12 +230,12 @@ module m1n3_v4::hash_share_market {
         transfer::share_object(order);
     }
 
-    /// Seller hits a posted bid, paying `Coin<T>` and receiving net SUI.
+    /// Seller hits a posted bid, paying `Coin<T>` and receiving net `QuoteT`.
     /// `units_to_sell` controls partial fill; passing `payment.value()`
     /// sells the whole coin.
-    public fun fill_buy_order<T>(
-        order: &mut BuyOrder<T>,
-        fee_pool: &MarketFeePool,
+    public fun fill_buy_order<T, QuoteT>(
+        order: &mut BuyOrder<T, QuoteT>,
+        fee_pool: &MarketFeePool<QuoteT>,
         payment_in: Coin<T>,
         ctx: &mut TxContext,
     ) {
@@ -232,13 +255,13 @@ module m1n3_v4::hash_share_market {
         let fee = mul_div(gross, FEE_BPS, BPS_DENOM, rounding::down()).destroy_some();
         let net = gross - fee;
 
-        let mut sui_out = order.payment.split(gross);
-        let fee_balance = sui_out.split(fee);
+        let mut quote_out = order.payment.split(gross);
+        let fee_balance = quote_out.split(fee);
 
         // Hand HashShare inventory to the buyer.
         transfer::public_transfer(coin::from_balance(payment_in.into_balance(), ctx), order.buyer);
-        // Net SUI to seller.
-        transfer::public_transfer(coin::from_balance(sui_out, ctx), seller);
+        // Net quote to seller.
+        transfer::public_transfer(coin::from_balance(quote_out, ctx), seller);
         // Fee direct to admin — no shared-object write on fee_pool.
         transfer::public_transfer(coin::from_balance(fee_balance, ctx), fee_pool.admin);
 
@@ -254,16 +277,16 @@ module m1n3_v4::hash_share_market {
     }
 
     /// Top up the budget of an existing BuyOrder.
-    public fun top_up_buy_order<T>(
-        order: &mut BuyOrder<T>,
-        payment: Coin<SUI>,
+    public fun top_up_buy_order<T, QuoteT>(
+        order: &mut BuyOrder<T, QuoteT>,
+        payment: Coin<QuoteT>,
     ) {
         order.payment.join(payment.into_balance());
     }
 
     /// Buyer-only. Replaces the price; doesn't touch budget or inventory.
-    public fun update_buy_order_price<T>(
-        order: &mut BuyOrder<T>,
+    public fun update_buy_order_price<T, QuoteT>(
+        order: &mut BuyOrder<T, QuoteT>,
         new_price_per_unit_mist: u64,
         ctx: &TxContext,
     ) {
@@ -280,7 +303,7 @@ module m1n3_v4::hash_share_market {
         });
     }
 
-    public fun cancel_buy_order<T>(order: BuyOrder<T>, ctx: &mut TxContext) {
+    public fun cancel_buy_order<T, QuoteT>(order: BuyOrder<T, QuoteT>, ctx: &mut TxContext) {
         assert!(order.buyer == tx_context::sender(ctx), ENotBuyer);
         let BuyOrder { id, buyer, price_per_unit_mist: _, payment, expires_epoch: _ } = order;
         let refund = payment.value();
@@ -300,7 +323,7 @@ module m1n3_v4::hash_share_market {
 
     /// Permissionless cleanup of an expired BuyOrder. Refunds residual to
     /// the original buyer.
-    public fun cleanup_expired_buy_order<T>(order: BuyOrder<T>, ctx: &mut TxContext) {
+    public fun cleanup_expired_buy_order<T, QuoteT>(order: BuyOrder<T, QuoteT>, ctx: &mut TxContext) {
         assert!(option::is_some(&order.expires_epoch), ENotExpired);
         assert!(
             tx_context::epoch(ctx) >= *option::borrow(&order.expires_epoch),
@@ -324,7 +347,7 @@ module m1n3_v4::hash_share_market {
 
     // ── SellOrder API ─────────────────────────────────────────────────────────
 
-    public fun place_sell_order<T>(
+    public fun place_sell_order<T, QuoteT>(
         price_per_unit_mist: u64,
         expires_epoch: u64,
         inventory: Coin<T>,
@@ -336,7 +359,7 @@ module m1n3_v4::hash_share_market {
         let seller = tx_context::sender(ctx);
         let exp = if (expires_epoch == 0) { option::none() } else { option::some(expires_epoch) };
 
-        let order = SellOrder<T> {
+        let order = SellOrder<T, QuoteT> {
             id: object::new(ctx),
             seller,
             price_per_unit_mist,
@@ -356,10 +379,10 @@ module m1n3_v4::hash_share_market {
     /// Buyer hits a posted ask. `units_to_buy` controls partial fill;
     /// caller's payment must cover `units_to_buy × price`. Any overpayment
     /// is refunded.
-    public fun fill_sell_order<T>(
-        order: &mut SellOrder<T>,
-        fee_pool: &MarketFeePool,
-        mut payment: Coin<SUI>,
+    public fun fill_sell_order<T, QuoteT>(
+        order: &mut SellOrder<T, QuoteT>,
+        fee_pool: &MarketFeePool<QuoteT>,
+        payment: Coin<QuoteT>,
         units_to_buy: u64,
         ctx: &mut TxContext,
     ) {
@@ -385,7 +408,7 @@ module m1n3_v4::hash_share_market {
         // Inventory to buyer.
         let hashshares_out = order.inventory.split(units_to_buy);
         transfer::public_transfer(coin::from_balance(hashshares_out, ctx), buyer);
-        // Net SUI to seller.
+        // Net quote to seller.
         transfer::public_transfer(coin::from_balance(to_pay, ctx), order.seller);
         // Fee direct to admin.
         transfer::public_transfer(coin::from_balance(fee_balance, ctx), fee_pool.admin);
@@ -407,8 +430,8 @@ module m1n3_v4::hash_share_market {
     }
 
     /// Seller-only. Replaces the price; doesn't touch inventory.
-    public fun update_sell_order_price<T>(
-        order: &mut SellOrder<T>,
+    public fun update_sell_order_price<T, QuoteT>(
+        order: &mut SellOrder<T, QuoteT>,
         new_price_per_unit_mist: u64,
         ctx: &TxContext,
     ) {
@@ -425,14 +448,14 @@ module m1n3_v4::hash_share_market {
         });
     }
 
-    public fun top_up_sell_order<T>(
-        order: &mut SellOrder<T>,
+    public fun top_up_sell_order<T, QuoteT>(
+        order: &mut SellOrder<T, QuoteT>,
         more_inventory: Coin<T>,
     ) {
         order.inventory.join(more_inventory.into_balance());
     }
 
-    public fun cancel_sell_order<T>(order: SellOrder<T>, ctx: &mut TxContext) {
+    public fun cancel_sell_order<T, QuoteT>(order: SellOrder<T, QuoteT>, ctx: &mut TxContext) {
         assert!(order.seller == tx_context::sender(ctx), ENotSeller);
         let SellOrder { id, seller, price_per_unit_mist: _, inventory, expires_epoch: _ } = order;
         let refund = inventory.value();
@@ -450,7 +473,7 @@ module m1n3_v4::hash_share_market {
         };
     }
 
-    public fun cleanup_expired_sell_order<T>(order: SellOrder<T>, ctx: &mut TxContext) {
+    public fun cleanup_expired_sell_order<T, QuoteT>(order: SellOrder<T, QuoteT>, ctx: &mut TxContext) {
         assert!(option::is_some(&order.expires_epoch), ENotExpired);
         assert!(
             tx_context::epoch(ctx) >= *option::borrow(&order.expires_epoch),
@@ -476,8 +499,8 @@ module m1n3_v4::hash_share_market {
 
     /// Step 1 of admin handoff. Current admin nominates `new_admin`. Setting
     /// `new_admin == @0x0` clears any pending proposal.
-    public fun propose_admin(
-        fee_pool: &mut MarketFeePool,
+    public fun propose_admin<QuoteT>(
+        fee_pool: &mut MarketFeePool<QuoteT>,
         new_admin: address,
         ctx: &TxContext,
     ) {
@@ -495,8 +518,8 @@ module m1n3_v4::hash_share_market {
     }
 
     /// Step 2 of admin handoff. Must be called by the proposed address.
-    public fun accept_admin(
-        fee_pool: &mut MarketFeePool,
+    public fun accept_admin<QuoteT>(
+        fee_pool: &mut MarketFeePool<QuoteT>,
         ctx: &TxContext,
     ) {
         assert!(option::is_some(&fee_pool.pending_admin), ENoPendingAdmin);
@@ -514,20 +537,23 @@ module m1n3_v4::hash_share_market {
 
     // ── Read accessors ────────────────────────────────────────────────────────
 
-    public fun buy_buyer<T>(o: &BuyOrder<T>): address { o.buyer }
-    public fun buy_price<T>(o: &BuyOrder<T>): u64 { o.price_per_unit_mist }
-    public fun buy_budget<T>(o: &BuyOrder<T>): u64 { o.payment.value() }
-    public fun buy_expires<T>(o: &BuyOrder<T>): Option<u64> { o.expires_epoch }
+    public fun buy_buyer<T, QuoteT>(o: &BuyOrder<T, QuoteT>): address { o.buyer }
+    public fun buy_price<T, QuoteT>(o: &BuyOrder<T, QuoteT>): u64 { o.price_per_unit_mist }
+    public fun buy_budget<T, QuoteT>(o: &BuyOrder<T, QuoteT>): u64 { o.payment.value() }
+    public fun buy_expires<T, QuoteT>(o: &BuyOrder<T, QuoteT>): Option<u64> { o.expires_epoch }
 
-    public fun sell_seller<T>(o: &SellOrder<T>): address { o.seller }
-    public fun sell_price<T>(o: &SellOrder<T>): u64 { o.price_per_unit_mist }
-    public fun sell_inventory<T>(o: &SellOrder<T>): u64 { o.inventory.value() }
-    public fun sell_expires<T>(o: &SellOrder<T>): Option<u64> { o.expires_epoch }
+    public fun sell_seller<T, QuoteT>(o: &SellOrder<T, QuoteT>): address { o.seller }
+    public fun sell_price<T, QuoteT>(o: &SellOrder<T, QuoteT>): u64 { o.price_per_unit_mist }
+    public fun sell_inventory<T, QuoteT>(o: &SellOrder<T, QuoteT>): u64 { o.inventory.value() }
+    public fun sell_expires<T, QuoteT>(o: &SellOrder<T, QuoteT>): Option<u64> { o.expires_epoch }
 
-    public fun fee_pool_admin(fp: &MarketFeePool): address { fp.admin }
+    public fun fee_pool_admin<QuoteT>(fp: &MarketFeePool<QuoteT>): address { fp.admin }
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
+    /// Test-only fee pool spawner that mirrors the existing tests'
+    /// `init_for_testing` shape, but parameterized by quote type. Tests can
+    /// either pass `SUI` to keep their old behaviour or any other quote.
     #[test_only]
-    public fun init_for_testing(ctx: &mut TxContext) { init(ctx); }
+    public fun init_for_testing<QuoteT>(ctx: &mut TxContext) { create_fee_pool<QuoteT>(ctx); }
 }

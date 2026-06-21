@@ -261,4 +261,192 @@ module m1n3_v4::btc_math_tests {
 
         assert!(!btc_math::verify_merkle_proof(root, path, tx0, 0), 0);
     }
+
+    // ── verify_derived_coinbase ───────────────────────────────────────────────
+    //
+    // Fixture layout used throughout:
+    //   parent_coinbase2 = [0x01]                           // vout_count = 1
+    //                    || vout_0 (buyer's 25-byte P2PKH script + 8-byte value)
+    //                    || [0x00, 0x00, 0x00, 0x00]        // locktime
+    //
+    //   derived_coinbase2 = [0x02]                          // vout_count = 2
+    //                     || vout_0 (identical to parent's vout_0)
+    //                     || vout_1 (miner's appended output)
+    //                     || [0x00, 0x00, 0x00, 0x00]       // identical locktime
+    //
+    // The values inside each vout are arbitrary bytes — the verifier only
+    // checks byte-level structural equivalence, not script validity.
+
+    /// Synthesize a vout (8-byte LE value + 1-byte script_len + script bytes).
+    fun mk_vout(value_le: vector<u8>, script: vector<u8>): vector<u8> {
+        let mut out = vector[];
+        // Caller passes value as 8 LE bytes for simplicity (avoid u64-encoding logic in tests).
+        vector::append(&mut out, value_le);
+        vector::push_back(&mut out, (vector::length(&script) as u8));
+        vector::append(&mut out, script);
+        out
+    }
+
+    fun mk_coinbase2(vouts: vector<vector<u8>>, locktime: vector<u8>): vector<u8> {
+        let mut buf = vector[];
+        vector::push_back(&mut buf, (vector::length(&vouts) as u8));
+        let n = vector::length(&vouts);
+        let mut i = 0;
+        while (i < n) {
+            vector::append(&mut buf, *vector::borrow(&vouts, i));
+            i = i + 1;
+        };
+        vector::append(&mut buf, locktime);
+        buf
+    }
+
+    fun buyer_vout(): vector<u8> {
+        mk_vout(
+            x"0034e23000000000",                        // 822,000,000 sats LE (~ 8.22 BTC)
+            x"76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac", // P2PKH buyer
+        )
+    }
+
+    fun miner_vout(): vector<u8> {
+        mk_vout(
+            x"4030010000000000",                        // 78,400 sats (tx fees)
+            x"76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac",
+        )
+    }
+
+    fun zero_locktime(): vector<u8> { x"00000000" }
+
+    #[test]
+    fun verify_derived_coinbase_happy_path() {
+        let parent = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        let derived = mk_coinbase2(vector[buyer_vout(), miner_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EDerivedFewerOutputs)]
+    fun verify_derived_coinbase_fails_when_same_count() {
+        // Derived has same vout_count as parent → not actually a derivation.
+        let parent = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        let derived = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EParentVoutsNotPreserved)]
+    fun verify_derived_coinbase_fails_when_buyer_vout_redirected() {
+        // Attack: miner swaps buyer's vout_0 with their own address.
+        let parent = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        let attacker_vout = mk_vout(
+            x"0034e23000000000",
+            x"76a914cccccccccccccccccccccccccccccccccccccccc88ac",
+        );
+        let derived = mk_coinbase2(vector[attacker_vout, miner_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EParentVoutsNotPreserved)]
+    fun verify_derived_coinbase_fails_when_buyer_value_changed() {
+        // Attack: miner keeps buyer's script but lowers their value.
+        let parent = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        let cheated_buyer = mk_vout(
+            x"0010000000000000",                         // ~1,048,576 sats (drastically lower)
+            x"76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac",
+        );
+        let derived = mk_coinbase2(vector[cheated_buyer, miner_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::ELocktimeMismatch)]
+    fun verify_derived_coinbase_fails_when_locktime_changes() {
+        let parent = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        let derived = mk_coinbase2(vector[buyer_vout(), miner_vout()], x"ffffffff");
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EUnsupportedVarintWidth)]
+    fun verify_derived_coinbase_fails_on_multibyte_varint() {
+        // Parent's vout_count uses the 0xfd (3-byte) varint form → unsupported in v1.
+        let mut parent = vector[0xfd, 0x01, 0x00];     // varint(1) in 3-byte form
+        vector::append(&mut parent, buyer_vout());
+        vector::append(&mut parent, zero_locktime());
+        let derived = mk_coinbase2(vector[buyer_vout(), miner_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&parent, &derived);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::ECoinbaseTooShort)]
+    fun verify_derived_coinbase_fails_when_too_short() {
+        let too_short = x"01000000";                    // 4 bytes
+        let derived = mk_coinbase2(vector[buyer_vout(), miner_vout()], zero_locktime());
+        btc_math::test_verify_derived_coinbase(&too_short, &derived);
+    }
+
+    // ── verify_vout_1_script ─────────────────────────────────────────────────
+    //
+    // Same fixture style. MPC scriptPubKey is a P2TR shape (`5120` + 32 bytes
+    // of x-only tweaked pubkey = 34 bytes total). Buyer's vout_0 is P2PKH.
+
+    fun mpc_script(): vector<u8> {
+        // P2TR: OP_1 OP_DATA_32 <32 bytes>
+        x"5120deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    }
+
+    fun mpc_vout(): vector<u8> {
+        mk_vout(
+            x"4030010000000000",                        // ~78,400 sats (tx-fee total)
+            mpc_script(),
+        )
+    }
+
+    #[test]
+    fun verify_vout_1_script_happy_path() {
+        let cb2 = mk_coinbase2(vector[buyer_vout(), mpc_vout()], zero_locktime());
+        btc_math::test_verify_vout_1_script(&cb2, &mpc_script());
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::ECoinbaseMissingVout1)]
+    fun verify_vout_1_script_fails_when_only_one_vout() {
+        let cb2 = mk_coinbase2(vector[buyer_vout()], zero_locktime());
+        btc_math::test_verify_vout_1_script(&cb2, &mpc_script());
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EWrongVout1Script)]
+    fun verify_vout_1_script_fails_on_wrong_script_bytes() {
+        let bad = mk_vout(
+            x"4030010000000000",
+            x"5120cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe", // different P2TR
+        );
+        let cb2 = mk_coinbase2(vector[buyer_vout(), bad], zero_locktime());
+        btc_math::test_verify_vout_1_script(&cb2, &mpc_script());
+    }
+
+    #[test]
+    #[expected_failure(abort_code = btc_math::EWrongVout1Script)]
+    fun verify_vout_1_script_fails_on_wrong_length() {
+        let too_long = mk_vout(
+            x"4030010000000000",
+            // 36-byte script (extra OP_NOP at the end) — length mismatch.
+            x"5120deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef6161",
+        );
+        let cb2 = mk_coinbase2(vector[buyer_vout(), too_long], zero_locktime());
+        btc_math::test_verify_vout_1_script(&cb2, &mpc_script());
+    }
+
+    #[test]
+    fun verify_vout_1_script_works_with_extra_vouts() {
+        // Buyer can add MORE vouts after vout_1 — the verifier only fixes
+        // vout_1's script. Extra outputs (e.g. an OP_RETURN commitment) are allowed.
+        let extra = mk_vout(
+            x"0000000000000000",
+            x"6a04deadbeef", // OP_RETURN with 4 bytes of data
+        );
+        let cb2 = mk_coinbase2(vector[buyer_vout(), mpc_vout(), extra], zero_locktime());
+        btc_math::test_verify_vout_1_script(&cb2, &mpc_script());
+    }
 }

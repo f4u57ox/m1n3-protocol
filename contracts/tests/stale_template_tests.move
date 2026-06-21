@@ -46,6 +46,15 @@ module m1n3_v4::stale_template_tests {
         { share_dedup::init_for_testing(ts::ctx(sc)); };
         ts::next_tx(sc, ADMIN);
         { miner::init_for_testing(ts::ctx(sc)); };
+        // See `set_min_difficulty_for_testing` in pool.move — drop the
+        // production floor (1,000,000) so the test fixtures' deterministic
+        // share hashes get accepted.
+        ts::next_tx(sc, ADMIN);
+        {
+            let mut pool_obj = ts::take_shared<m1n3_v4::pool::Pool>(sc);
+            pool::set_min_difficulty_for_testing(&mut pool_obj, 1);
+            ts::return_shared(pool_obj);
+        };
         ts::next_tx(sc, MINER);
         {
             let clk = clock::create_for_testing(ts::ctx(sc));

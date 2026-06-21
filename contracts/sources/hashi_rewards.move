@@ -10,15 +10,18 @@
 ///
 /// State machine per batch:
 ///   PENDING → FUNDED → COMPLETED
-///                    → EXPIRED   (admin reclaims after claim deadline if not all claimed)
+///                    → EXPIRED   (any caller recycles unclaimed funds back to
+///                                 the vault after the claim deadline)
 ///
 /// Per-miner amounts are computed on-chain at claim time using MinerWorkRecord
 /// (produced during round accumulation) and RoundHistory (frozen totals).
 /// The operator only needs to supply the total block reward — no off-chain
 /// per-miner amount computation required.
 ///
-/// Claim deadline: set by admin at fund time. After deadline, admin can reclaim
-/// any unclaimed funds via admin_reclaim_expired, preventing permanent lock.
+/// Claim deadline: a fixed `TRUSTLESS_CLAIM_WINDOW_MS` constant set at fund
+/// time. After the deadline, `recycle_expired_to_vault` returns any unclaimed
+/// balance to the `HashiVault` (permissionless — no admin path), preventing
+/// permanent lock without re-introducing operator discretion.
 module m1n3_v4::hashi_rewards {
     use sui::coin::{Self};
     use sui::balance::{Self, Balance};
