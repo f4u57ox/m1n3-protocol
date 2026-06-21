@@ -14,6 +14,8 @@ web/*.zip
 *.tsbuildinfo
 # Fumadocs build/source cache — regenerated on `next dev`
 web/.source/
+# Vendored confidential-transfers SDK (cloned by scripts/vendor-confidential-transfers.sh)
+web/vendor/
 
 # Sui build artifacts
 contracts/build/

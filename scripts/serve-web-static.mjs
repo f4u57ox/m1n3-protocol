@@ -1,4 +1,4 @@
-import { createReadStream, existsSync } from 'node:fs';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
@@ -31,7 +31,22 @@ function resolvePath(urlPath) {
   const direct = resolve(join(root, clean));
   if (!direct.startsWith(root)) return null;
 
-  if (existsSync(direct)) return direct;
+  // Next's static export uses `trailingSlash: true` — every route is
+  // emitted as `<route>/index.html`. When the requested URL resolves to
+  // a directory, look for index.html inside it. Without this every
+  // sub-route 404s.
+  if (existsSync(direct)) {
+    try {
+      if (statSync(direct).isDirectory()) {
+        const idx = join(direct, 'index.html');
+        if (existsSync(idx)) return idx;
+      } else {
+        return direct;
+      }
+    } catch {
+      return direct;
+    }
+  }
   if (!extname(direct) && existsSync(`${direct}.html`)) return `${direct}.html`;
   if (pathname === '/' && existsSync(join(root, 'index.html'))) return join(root, 'index.html');
   return null;

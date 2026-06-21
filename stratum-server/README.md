@@ -37,6 +37,34 @@ When `--miner-keypair` is set the server batches shares and signs each Sui trans
   --miner-batch-timeout-ms 30000
 ```
 
+### Buyer mode (`POOL_ADMIN_CAP` empty)
+
+The same binary runs as a buyer's own full node — feeds their miners block templates and registers each one on chain under `Template.owner = buyer`. Toggled at startup by clearing `POOL_ADMIN_CAP`:
+
+| `POOL_ADMIN_CAP` | Entry called | `Template.owner` | Per-template fee |
+|---|---|---|---|
+| set | `pool::register_template` | `SUI_ADDRESS` (operator) | none (admin path) |
+| empty | `pool::register_template_public` | `SUI_ADDRESS` (buyer) | 0.01 SUI |
+
+A buyer who has placed a `BuyerHashpowerOrder<QuoteT>` runs the stratum in this mode, pairs it with `miner-sidecar --hashpower-buy-order-id <ORDER_ID>`, and points their ASIC at the sidecar's `:3334`. Every accepted share drains the order by `difficulty × order.price_per_difficulty` µQuote.
+
+```bash
+# Buyer side — fund the order once (sui-client/src/bin/place-buyer-order)
+# Then run their own stratum + sidecar against their own bitcoind:
+POOL_ADMIN_CAP= ./target/release/stratum-server \
+  --sui-package <PACKAGE_ID> \
+  --pool-object <POOL_OBJECT_ID> \
+  --sui-address <BUYER_SUI_ADDRESS> \
+  --sui-keystore ~/.sui/sui_config/sui.keystore \
+  --bitcoin-rpc http://<rpc-user>:<rpc-password>@127.0.0.1:8332 \
+  --pool-address <BUYER_BTC_SCRIPTPUBKEY> \
+  --port 3333
+```
+
+### Static-job override (`--override-template-id`)
+
+Pins one on-chain Template id as the only job the server advertises — no bitcoind polling, no auto-rotation. Useful for replaying a known job or wiring tests against a deterministic share corpus. The buyer / operator restarts the server with a new id when they want to swap templates. In normal operation leave unset.
+
 ---
 
 ## CLI Arguments
@@ -66,6 +94,8 @@ When `--miner-keypair` is set the server batches shares and signs each Sui trans
 | `--default-selection` | — | `stake` | Template selection mode: `stake`, `shares`, `combined` |
 | `--template-cache-secs` | — | `5` | Template cache refresh interval |
 | `--metrics-port` | — | `9091` | HTTP metrics port (0 = disabled) |
+| `--override-template-id` | `OVERRIDE_TEMPLATE_ID` | `""` | Pin a single on-chain Template as the only job (skips bitcoind polling). |
+| `--sui-address` | `SUI_ADDRESS` | first key | Sui address whose key signs template registrations. In buyer mode set this to the buyer wallet. |
 
 ---
 

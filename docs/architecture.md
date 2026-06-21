@@ -109,6 +109,10 @@ object, not to a caller.
   is broken out in [`trustless-address.md`](trustless-address.md).
 - Per-integration notes (DeepBook V3, Hashi, OZ contracts-sui) are in
   [`integrations.md`](integrations.md).
+- How miners choose between verification-only, auto-sell, and the
+  roadmap auto-fill-bids modes is documented in
+  [`miner-modes.md`](miner-modes.md), including dynamic-pricing patterns
+  for market-adaptive miners.
 - The Move source itself is fully commented:
   [`contracts/sources/pool.move`](../contracts/sources/pool.move),
   [`hashi_rewards.move`](../contracts/sources/hashi_rewards.move),

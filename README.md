@@ -108,6 +108,15 @@ m1n3_v4 contracts on Sui
    └─ hashi_rewards::claim_reward<BTC>           (each miner claims their slice)
 ```
 
+### Buyer-template lane
+
+A second on-chain rail (V3 + V4 upgrades) lets buyers fund USDC orders that pay miners per share for hashing *their* block templates:
+
+- **V1 `HashpowerBuyOrder<QuoteT>`** — pinned to a single Template id. Legacy; goes stale on every buyer re-publish. Kept for back-compat cleanup.
+- **V2 `BuyerHashpowerOrder<QuoteT>`** — buyer-bound. `submit_share_for_buyer_pay` asserts `template.owner == order.buyer` so the same order drains on any future template the buyer registers — no cancel/re-place cycle.
+
+The `stratum-server` binary doubles as the buyer's full node: clear `POOL_ADMIN_CAP` and set `SUI_ADDRESS` to the buyer wallet, and templates auto-register via `register_template_public` (0.01 SUI fee per template, `Template.owner = buyer`). Both order kinds appear side-by-side on `/marketplace?tab=private` with a V1/V2 chip and inline cancel / re-price / top-up actions for the order's buyer. See [`CLAUDE.md`](./CLAUDE.md#7-buyer-template-lane) for the full surface (entries, ops binaries, `ProtocolMPCConfig`).
+
 ## What's deployed
 
 | Object | Testnet ID | Network |
@@ -167,6 +176,28 @@ ASICs connect to `stratum+tcp://<host>:3333` (operator path) or
   rust snippet, a worked example using our actual deployed vault.
 - **[`docs/integrations.md`](docs/integrations.md)** — what we leverage
   from Sui Move, DeepBook V3, Hashi, OpenZeppelin contracts-sui, and how.
+- **[`docs/miner-modes.md`](docs/miner-modes.md)** — the three operating
+  modes a miner can run today (verification only / auto-sell at floor /
+  auto-fill bids), the exact CLI flags, and dynamic-pricing patterns for
+  market-adaptive miners.
+- **[`docs/otc.md`](docs/otc.md)** — atomic on-chain OTC for HashShare
+  positions: a Move escrow (`m1n3_confidential_otc`) holds the
+  seller's `Coin<HS_NNN>` until the buyer signs a single PTB that
+  pays the agreed `Coin<DUSDC>` and receives the deliverable
+  atomically. Layered post-settle, the buyer can wrap the received
+  HashShare into a confidential
+  [`MystenLabs/confidential-transfers`](https://github.com/MystenLabs/confidential-transfers)
+  `TokenAccount` so subsequent balance state stays opaque — the
+  pieces of an institutional rail that resolves to hBTC via Hashi
+  later. **Read the doc** before pitching the privacy story — Phase
+  A leaks per-trade size on the escrow object; Phase B closes that
+  with an on-chain confidential pay leg + NIZK equality proof.
+- **[`docs/hedge.md`](docs/hedge.md)** — mining-revenue hedge via
+  DeepBook Predict: math derivation of the put-strip construction,
+  Monte-Carlo proof that hedged σ < unhedged σ and hedged P05 lifts,
+  and how the `/hedge` page chains create_manager + deposit + N×
+  mint_range into one PTB. **Testnet only** (Predict's current
+  deployment) — DUSDC faucet at <https://tally.so/r/Xx102L>.
 - **Fumadocs MDX site** at `/docs/` in the deployed dapp — getting-started
   guides, hashprice / difficulty primers, protocol reference.
 
@@ -177,6 +208,26 @@ claim — programmable, on-chain Bitcoin mining-pool payouts where the
 BTC recipient itself is a function of Sui state — is a programmable
 payment primitive. See the [submission](https://mystenlabs.notion.site/defi-payments-problem-statement)
 for context.
+
+Also entering the **DeepBook track** with the mining-revenue hedge in
+[`docs/hedge.md`](docs/hedge.md): an end-to-end integration of
+DeepBook Predict that lets miners synthesize a put on their expected
+BTC revenue using the live SVI vol surface. The `/hedge` route on the
+dapp signs a single PTB chaining `predict::create_manager` +
+`predict_manager::deposit<DUSDC>` + N×`predict::mint_range<DUSDC>`,
+and shows a Monte-Carlo proof that hedged variance < unhedged
+variance and that the 5th-percentile revenue lifts strictly.
+
+A **confidential-transfers track** integration is partially landed
+in [`docs/otc.md`](docs/otc.md): on devnet, where m1n3, Hashi, and
+[MystenLabs/confidential-transfers](https://github.com/MystenLabs/confidential-transfers)
+all coexist, the new `m1n3_confidential_otc` Move escrow lets a
+miner and an institution settle a `Coin<HS_NNN>` ↔ `Coin<DUSDC>` swap
+in one atomic PTB. Post-settle the institution can confidentially
+wrap their received HashShare via the TS SDK, and later
+`hash_share::redeem` it for real hBTC. Phase A's escrow object
+publishes the trade size on chain; Phase B (on-chain confidential pay
+leg + NIZK equality proof) is documented and out of this PR.
 
 Built between May 7 and June 21, 2026.
 
