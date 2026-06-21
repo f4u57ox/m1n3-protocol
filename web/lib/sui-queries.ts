@@ -14,18 +14,21 @@ import type { TemplateData, PoolData, MinerStatsData } from './types';
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// How many of the most-recently-registered templates are tagged "Active"
+/// in the UI. The on-chain protocol accepts shares against any template
+/// whose `round_id == pool.current_round` (enforced by `pool::submit_share`
+/// and `miner::EStaleTemplate`), but at testnet difficulty that's dozens
+/// per round. Miners' ASICs only ever work on the latest 1-3 jobs because
+/// stratum's `mining.notify` pushes refreshed jobs every ~30 seconds with
+/// `clean_jobs=true`. So "Active" here means *currently being mined*, not
+/// *technically valid for share submission*.
+const ACTIVE_TEMPLATE_WINDOW = 3;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseTemplateJson(
   json: Record<string, any>,
   id: string,
-  poolCurrentRound?: number,
 ): TemplateData {
-  // Templates are now frozen (immutable) on registration — no `is_active` field.
-  // A template is "active" iff its snapshotted round_id matches the pool's
-  // current round; once the round closes, the template is historical.
-  const templateRound = parseU64(json.round_id ?? 0);
-  const isActive =
-    poolCurrentRound === undefined ? true : templateRound >= poolCurrentRound;
   return {
     id,
     height: parseU64(json.height),
@@ -36,7 +39,7 @@ function parseTemplateJson(
     version: parseU64(json.version),
     nbits: parseU64(json.nbits),
     ntime: parseU64(json.ntime),
-    isActive,
+    isActive: false, // set in fetchActiveTemplates after sorting
     owner: typeof json.owner === 'string' ? json.owner : '',
     createdAtMs: parseU64(json.created_at_ms),
     shareCount: 0,
@@ -89,8 +92,16 @@ export async function fetchPoolHashrate(): Promise<{ instantaneous: number; aver
 const EVENT_PAGE_SIZE = 50;
 const MAX_PAGES = 20;
 
-async function fetchShareCountsByTemplate(): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
+interface PerTemplateShareInfo {
+  /** Number of `ShareSubmitted` events observed for this template. */
+  count: number;
+  /** Tx digest of the *most recent* `ShareSubmitted` (by event timestamp). */
+  lastDigest?: string;
+  lastTimestampMs?: number;
+}
+
+async function fetchShareInfoByTemplate(): Promise<Map<string, PerTemplateShareInfo>> {
+  const out = new Map<string, PerTemplateShareInfo>();
   const packageId = ORIGINAL_PACKAGE_ID;
   if (!packageId) return out;
   const eventType = `${packageId}::pool::ShareSubmitted`;
@@ -99,8 +110,12 @@ async function fetchShareCountsByTemplate(): Promise<Map<string, number>> {
     let data: {
       events: {
         pageInfo: { hasNextPage: boolean; endCursor: string | null };
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        nodes: { contents: { json: Record<string, any> } | null }[];
+        nodes: {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          contents: { json: Record<string, any> } | null;
+          transaction: { digest: string } | null;
+          timestamp: string | null;
+        }[];
       };
     };
     try {
@@ -108,21 +123,86 @@ async function fetchShareCountsByTemplate(): Promise<Map<string, number>> {
         `query ShareEventsForCount($type: String!, $cursor: String, $first: Int!) {
           events(filter: { type: $type }, first: $first, after: $cursor) {
             pageInfo { hasNextPage endCursor }
-            nodes { contents { json } }
+            nodes {
+              contents { json }
+              transaction { digest }
+              timestamp
+            }
           }
         }`,
         { type: eventType, cursor, first: EVENT_PAGE_SIZE },
       );
     } catch (err) {
-      console.error('[sui-queries] fetchShareCountsByTemplate page failed:', err);
+      console.error('[sui-queries] fetchShareInfoByTemplate page failed:', err);
       break;
     }
     const evs = data?.events;
     if (!evs) break;
     for (const node of evs.nodes) {
       const tid = node.contents?.json?.template_id;
-      if (typeof tid === 'string' && tid.length > 0) {
-        out.set(tid, (out.get(tid) ?? 0) + 1);
+      if (typeof tid !== 'string' || tid.length === 0) continue;
+      const digest = node.transaction?.digest;
+      const ts = node.timestamp ? Date.parse(node.timestamp) : NaN;
+      const cur = out.get(tid) ?? { count: 0 };
+      cur.count += 1;
+      if (digest && (cur.lastTimestampMs === undefined || (Number.isFinite(ts) && ts > cur.lastTimestampMs))) {
+        cur.lastDigest = digest;
+        cur.lastTimestampMs = Number.isFinite(ts) ? ts : cur.lastTimestampMs;
+      }
+      out.set(tid, cur);
+    }
+    if (!evs.pageInfo.hasNextPage) break;
+    cursor = evs.pageInfo.endCursor;
+  }
+  return out;
+}
+
+/**
+ * Paginate `TemplateRegistered` events and return a map from `template_id`
+ * to the tx digest that registered it. One digest per template (registration
+ * is a one-shot frozen-object emit).
+ */
+async function fetchTemplateRegistrationDigests(): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const packageId = ORIGINAL_PACKAGE_ID;
+  if (!packageId) return out;
+  const eventType = `${packageId}::pool::TemplateRegistered`;
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let data: {
+      events: {
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        nodes: {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          contents: { json: Record<string, any> } | null;
+          transaction: { digest: string } | null;
+        }[];
+      };
+    };
+    try {
+      data = await gql(
+        `query TemplateRegEvents($type: String!, $cursor: String, $first: Int!) {
+          events(filter: { type: $type }, first: $first, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              contents { json }
+              transaction { digest }
+            }
+          }
+        }`,
+        { type: eventType, cursor, first: EVENT_PAGE_SIZE },
+      );
+    } catch (err) {
+      console.error('[sui-queries] fetchTemplateRegistrationDigests page failed:', err);
+      break;
+    }
+    const evs = data?.events;
+    if (!evs) break;
+    for (const node of evs.nodes) {
+      const tid = node.contents?.json?.template_id;
+      const digest = node.transaction?.digest;
+      if (typeof tid === 'string' && digest && !out.has(tid)) {
+        out.set(tid, digest);
       }
     }
     if (!evs.pageInfo.hasNextPage) break;
@@ -150,14 +230,14 @@ export async function fetchActiveTemplates(): Promise<TemplateData[]> {
     const packageId = ORIGINAL_PACKAGE_ID;
     if (!packageId) return [];
 
-    // Aggregate per-template share counts from ShareSubmitted events.
-    // For a small protocol-wide volume this is fine; for production volumes
-    // we'd swap to a dedicated indexer view.
-    const shareCounts = await fetchShareCountsByTemplate();
-
-    // Read the pool's current round so we can mark older templates as inactive.
-    const pool = await fetchPoolStats();
-    const poolRound = pool?.currentRound;
+    // Aggregate per-template share counts + most-recent share digest from
+    // ShareSubmitted events, and pull each template's registration digest
+    // from TemplateRegistered events. Run in parallel — both walk the same
+    // indexer with disjoint event-type filters.
+    const [shareInfo, regDigests] = await Promise.all([
+      fetchShareInfoByTemplate(),
+      fetchTemplateRegistrationDigests(),
+    ]);
 
     const templateType = `${packageId}::pool::Template`;
     const templates: TemplateData[] = [];
@@ -179,8 +259,11 @@ export async function fetchActiveTemplates(): Promise<TemplateData[]> {
       for (const node of page.nodes) {
         const json = node.asMoveObject?.contents?.json;
         if (!json) continue;
-        const t = parseTemplateJson(json, node.address, poolRound);
-        t.shareCount = shareCounts.get(node.address) ?? 0;
+        const t = parseTemplateJson(json, node.address);
+        const info = shareInfo.get(node.address);
+        t.shareCount = info?.count ?? 0;
+        t.lastShareDigest = info?.lastDigest;
+        t.registrationDigest = regDigests.get(node.address);
         templates.push(t);
       }
 
@@ -188,11 +271,19 @@ export async function fetchActiveTemplates(): Promise<TemplateData[]> {
       cursor = page.pageInfo.endCursor;
     }
 
-    return templates.sort((a, b) => {
-      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
-      if (b.height !== a.height) return b.height - a.height;
-      return b.createdAtMs - a.createdAtMs;
+    // Sort by registration time (newest first), then mark the first
+    // ACTIVE_TEMPLATE_WINDOW as "Active". Anything older becomes "Historic".
+    // We use `createdAtMs` (registration time) rather than `round_id`
+    // because at testnet difficulty rounds rarely advance — the natural
+    // freshness signal is "when did the stratum register this".
+    const sorted = templates.sort((a, b) => {
+      if (b.createdAtMs !== a.createdAtMs) return b.createdAtMs - a.createdAtMs;
+      return b.height - a.height;
     });
+    for (let i = 0; i < sorted.length; i++) {
+      sorted[i].isActive = i < ACTIVE_TEMPLATE_WINDOW;
+    }
+    return sorted;
   } catch (err) {
     console.error('[sui-queries] fetchActiveTemplates failed:', err);
     return [];

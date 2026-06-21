@@ -24,9 +24,10 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ArrowUpDown, ExternalLink, Columns3, ChevronRight } from "lucide-react";
+import { ArrowUpDown, ExternalLink, Columns3, ChevronRight, FileCode2 } from "lucide-react";
 import type { TemplateData } from "@/lib/types";
 import { TemplateCard } from "./TemplateCard";
+import { suiscanTx } from "@/lib/utils";
 
 type SortKey = keyof TemplateData;
 type SortDir = "asc" | "desc";
@@ -67,8 +68,12 @@ const DEFAULT_VISIBLE: Set<ColumnKey> = new Set([
   "status",
 ]);
 
-export function TemplateTable() {
-  const { templates, loading, error } = useTemplates();
+export function TemplateTable({ excludeId }: { excludeId?: string } = {}) {
+  const { templates: allTemplates, loading, error } = useTemplates();
+  const templates = useMemo(
+    () => (excludeId ? allTemplates.filter((t) => t.id !== excludeId) : allTemplates),
+    [allTemplates, excludeId],
+  );
   const [sortKey, setSortKey] = useState<SortKey>("createdAtMs");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [filter, setFilter] = useState("");
@@ -442,16 +447,63 @@ export function TemplateTable() {
                           </TableCell>
                         )}
 
-                        {/* Link */}
+                        {/* Links — deep-link to template detail page +
+                            external tx links: template registration + most
+                            recent share submission on suiscan. */}
                         <TableCell>
-                          <Link
-                            href={`/template/${t.id}`}
-                            onClick={(e) => e.stopPropagation()}
-                            className="inline-flex items-center text-sm text-primary hover:underline"
-                            aria-label="Open template detail page"
-                          >
-                            <ExternalLink className="h-3 w-3" />
-                          </Link>
+                          <div className="inline-flex items-center gap-2">
+                            <Link
+                              href={`/template/${t.id}`}
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-flex items-center text-sm text-primary hover:underline"
+                              aria-label="Open template detail page"
+                              title="Open template detail page"
+                            >
+                              <FileCode2 className="h-3 w-3" />
+                            </Link>
+                            {t.registrationDigest ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <a
+                                    href={suiscanTx(t.registrationDigest)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="inline-flex items-center text-sm text-emerald-400 hover:underline"
+                                    aria-label="View registration tx on suiscan"
+                                  >
+                                    <ExternalLink className="h-3 w-3" />
+                                  </a>
+                                </TooltipTrigger>
+                                <TooltipContent side="left" className="font-mono text-[10px]">
+                                  Registration tx
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <ExternalLink className="h-3 w-3 text-muted-foreground/30" />
+                            )}
+                            {t.lastShareDigest ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <a
+                                    href={suiscanTx(t.lastShareDigest)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="inline-flex items-center text-sm text-sky-400 hover:underline"
+                                    aria-label="View latest share-submission tx on suiscan"
+                                  >
+                                    <ExternalLink className="h-3 w-3" />
+                                  </a>
+                                </TooltipTrigger>
+                                <TooltipContent side="left" className="font-mono text-[10px]">
+                                  Last share submission tx
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <ExternalLink className="h-3 w-3 text-muted-foreground/30" />
+                            )}
+                          </div>
                         </TableCell>
                       </TableRow>,
                       isExpanded ? (

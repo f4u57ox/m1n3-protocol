@@ -15,6 +15,8 @@ const navLinks = [
   { href: "/templates", label: "Templates" },
   { href: "/rewards", label: "Rewards" },
   { href: "/marketplace", label: "Market" },
+  { href: "/otc", label: "OTC" },
+  { href: "/hedge", label: "Hedge" },
   { href: "/tools", label: "Tools" },
   { href: "/docs", label: "Docs" },
 ];

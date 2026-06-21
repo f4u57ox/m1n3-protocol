@@ -15,6 +15,11 @@ export interface TemplateData {
   createdAtMs: number;
   shareCount: number;
   stakedAmount?: number;
+  /** Sui tx digest that registered this Template (frozen object) on chain. */
+  registrationDigest?: string;
+  /** Sui tx digest of the most recent `ShareSubmitted` event referencing
+   *  this template. Null when no share has landed against it yet. */
+  lastShareDigest?: string;
 }
 
 export interface PoolData {

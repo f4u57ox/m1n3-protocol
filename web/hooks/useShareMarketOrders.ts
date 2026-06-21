@@ -7,7 +7,7 @@ export interface ShareMarketOrder {
   objectId: string;
   owner: string;
   pricePerUnitMist: bigint;
-  /// Buy orders: remaining SUI budget in MIST.
+  /// Buy orders: remaining quote-token budget in the quote asset's base units.
   /// Sell orders: remaining inventory in HashShare units.
   remaining: bigint;
   /// For buy orders, the max units this order can still fill at its price.
@@ -15,28 +15,39 @@ export interface ShareMarketOrder {
   expiresEpoch: bigint | null;
 }
 
-const BUY_TYPE = (coin: string) =>
-  `${PACKAGE_ID}::hash_share_market::BuyOrder<${coin}>`;
-const SELL_TYPE = (coin: string) =>
-  `${PACKAGE_ID}::hash_share_market::SellOrder<${coin}>`;
+const BUY_TYPE = (coin: string, quote: string) =>
+  `${PACKAGE_ID}::hash_share_market::BuyOrder<${coin}, ${quote}>`;
+const SELL_TYPE = (coin: string, quote: string) =>
+  `${PACKAGE_ID}::hash_share_market::SellOrder<${coin}, ${quote}>`;
 
 /**
- * Discover active BuyOrder<T> and SellOrder<T> shared objects for a given
- * HashShare coin type. We query the module's `*OrderPlaced` events for IDs,
- * then `multiGetObjects` to fetch their current state and filter by struct
- * type (the event itself doesn't carry the type parameter).
+ * Discover active `BuyOrder<T, QuoteT>` and `SellOrder<T, QuoteT>` shared
+ * objects for a given HashShare coin type and quote asset. We query the
+ * module's `*OrderPlaced` events for IDs, then `multiGetObjects` to fetch
+ * their current state and filter by full struct type (the event itself
+ * doesn't carry the type parameters).
  *
  * Cancelled or filled-to-zero orders that have been deleted are skipped
  * because `getObject` returns null for them.
+ *
+ * Pass `quoteCoinType` to scope the orderbook to a specific quote asset
+ * (e.g. USDC on mainnet). Falls back to an empty result when missing so
+ * the hook is safe to mount before the quote is resolved.
  */
-export function useShareMarketOrders(coinType: string | undefined) {
+export function useShareMarketOrders(
+  coinType: string | undefined,
+  quoteCoinType: string | undefined,
+) {
   return useQuery<{ bids: ShareMarketOrder[]; asks: ShareMarketOrder[] }>({
-    queryKey: ["shareMarketOrders", coinType, ORIGINAL_PACKAGE_ID],
-    enabled: !!coinType && !!ORIGINAL_PACKAGE_ID && !!PACKAGE_ID,
+    queryKey: ["shareMarketOrders", coinType, quoteCoinType, ORIGINAL_PACKAGE_ID],
+    enabled:
+      !!coinType && !!quoteCoinType && !!ORIGINAL_PACKAGE_ID && !!PACKAGE_ID,
     refetchInterval: 15_000,
     staleTime: 5_000,
     queryFn: async () => {
-      if (!coinType || !ORIGINAL_PACKAGE_ID) return { bids: [], asks: [] };
+      if (!coinType || !quoteCoinType || !ORIGINAL_PACKAGE_ID) {
+        return { bids: [], asks: [] };
+      }
 
       const [buyEvents, sellEvents] = await Promise.all([
         suiClient.queryEvents({
@@ -70,8 +81,8 @@ export function useShareMarketOrders(coinType: string | undefined) {
         objects.push(...batch);
       }
 
-      const expectedBuy = BUY_TYPE(coinType);
-      const expectedSell = SELL_TYPE(coinType);
+      const expectedBuy = BUY_TYPE(coinType, quoteCoinType);
+      const expectedSell = SELL_TYPE(coinType, quoteCoinType);
       const bids: ShareMarketOrder[] = [];
       const asks: ShareMarketOrder[] = [];
 

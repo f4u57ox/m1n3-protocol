@@ -570,7 +570,24 @@ function detectAddress(
     type = "p2tr";
   }
   if (!type) return null;
+  // We compute the address ourselves for the witness-program kinds because
+  // bitcoinjs-lib v7's `fromOutputScript` requires `initEccLib` to be called
+  // before it'll bech32m-encode P2TR — and we don't want that runtime
+  // dependency in a browser bundle just to render a string. For legacy
+  // (P2PKH / P2SH) we still fall back to bitcoinjs.
   try {
+    if (type === "p2wpkh" || type === "p2wsh") {
+      // bytes 2..end are the witness program (20B or 32B), witness version 0.
+      const program = scriptBuf.slice(2);
+      const addr = btcAddress.toBech32(program, 0, networks.bitcoin.bech32);
+      return { type, address: addr };
+    }
+    if (type === "p2tr") {
+      // bytes 2..34 are the 32-byte x-only output key, witness version 1.
+      const program = scriptBuf.slice(2);
+      const addr = btcAddress.toBech32(program, 1, networks.bitcoin.bech32);
+      return { type, address: addr };
+    }
     const addr = btcAddress.fromOutputScript(scriptBuf, networks.bitcoin);
     return { type, address: addr };
   } catch {

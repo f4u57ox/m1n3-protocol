@@ -56,8 +56,11 @@ export type QuoteToken = {
    * Routing for swap/limit actions:
    * - `m1n3-market`: existing `hash_share_market` PTBs (SUI only).
    * - `deepbook`: DeepBookV3 pool created on-demand by the keeper.
+   * - `predict`: not a marketplace quote — only used as the Predict
+   *   protocol's quote-asset for hedging on `/hedge`. Never shown in
+   *   the marketplace selector.
    */
-  routing: 'm1n3-market' | 'deepbook';
+  routing: 'm1n3-market' | 'deepbook' | 'predict';
   /** Short note rendered in the dropdown. */
   note?: string;
 };
@@ -70,16 +73,23 @@ export type QuoteToken = {
  */
 const MAINNET_QUOTES: QuoteToken[] = [
   {
-    symbol: 'SUI',
-    type: '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI',
-    decimals: 9,
+    // Mainnet's in-house HashShare market is USDC-quoted (the v4 republish
+    // hardcodes Circle's native USDC as the `MarketFeePool<USDC>`). The
+    // generic `<T, QuoteT>` refactor of `hash_share_market` lets the same
+    // module serve SUI on testnet and USDC here without code drift.
+    symbol: 'USDC',
+    type: '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC',
+    decimals: 6,
     routing: 'm1n3-market',
     note: 'native · live',
   },
   {
-    symbol: 'USDC',
-    type: '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC',
-    decimals: 6,
+    // SUI on mainnet routes through a DeepBookV3 HS/SUI pool if one
+    // exists. Without a registered pool the order book reads empty —
+    // we don't have an in-house SUI-quoted market on mainnet by design.
+    symbol: 'SUI',
+    type: '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI',
+    decimals: 9,
     routing: 'deepbook',
     note: 'via DeepBookV3',
   },
@@ -166,6 +176,16 @@ const TESTNET_QUOTES: QuoteToken[] = [
     routing: 'deepbook',
     note: 'Walrus',
   },
+  {
+    // DeepBook Predict's testnet quote asset. Not the same coin as
+    // Circle USDC or DBUSDC. Faucet via https://tally.so/r/Xx102L.
+    // Used exclusively by the /hedge flow.
+    symbol: 'DUSDC',
+    type: '0xe95040085976bfd54a1a07225cd46c8a2b4e8e2b6732f140a0fc49850ba73e1a::dusdc::DUSDC',
+    decimals: 6,
+    routing: 'predict',
+    note: 'Predict quote',
+  },
 ];
 
 const DEVNET_QUOTES: QuoteToken[] = [
@@ -181,15 +201,22 @@ const DEVNET_QUOTES: QuoteToken[] = [
 
 const network = (SUI_NETWORK as Network) || 'devnet';
 
-export const QUOTE_TOKENS: QuoteToken[] =
+const ALL_QUOTES: QuoteToken[] =
   network === 'mainnet'
     ? MAINNET_QUOTES
     : network === 'testnet'
       ? TESTNET_QUOTES
       : DEVNET_QUOTES;
 
+/// Quotes shown in the /marketplace selector — Predict quote assets
+/// like DUSDC are excluded because they aren't real HashShare markets.
+export const QUOTE_TOKENS: QuoteToken[] = ALL_QUOTES.filter(
+  (t) => t.routing !== 'predict',
+);
+
+/// Look up any registered quote (including Predict-only ones).
 export function findQuoteToken(symbol: string): QuoteToken | undefined {
-  return QUOTE_TOKENS.find((t) => t.symbol === symbol);
+  return ALL_QUOTES.find((t) => t.symbol === symbol);
 }
 
 export function activeDeepBookConfig(): DeepBookConfig | null {

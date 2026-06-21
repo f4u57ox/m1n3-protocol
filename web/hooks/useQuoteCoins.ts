@@ -35,6 +35,10 @@ export function useQuoteCoins(
   );
 
   return {
+    /** The Move coin type the hook was queried for. Useful when several
+     * consumers share the same `useQuoteCoins` instance and need to
+     * decide whether their action targets the same coin type. */
+    coinType,
     ids,
     balance,
     isLoading: q.isLoading,

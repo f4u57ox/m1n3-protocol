@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { ChevronDown } from "lucide-react";
 import { PoolStats } from "@/components/PoolStats";
 import { RecentShares } from "@/components/RecentShares";
 import { MinerTable } from "@/components/MinerTable";
+import { FeaturedTemplate } from "@/components/FeaturedTemplate";
 import { useMiners } from "@/hooks/useMiners";
 import { useTemplates } from "@/hooks/useTemplates";
 
@@ -27,16 +28,61 @@ export function PoolOverviewTab() {
   const { templates, loading: templatesLoading } = useTemplates();
   const [templateFlowOpen, setTemplateFlowOpen] = useState(false);
   const [minerFlowOpen, setMinerFlowOpen] = useState(false);
+  const [moreTemplatesOpen, setMoreTemplatesOpen] = useState(false);
+
+  // Templates already arrive sorted by createdAtMs desc (active first).
+  const latest = useMemo(
+    () => (templates.length > 0 ? templates[0] : null),
+    [templates],
+  );
+  const otherCount = Math.max(0, templates.length - 1);
 
   return (
     <div className="space-y-6">
       <PoolStats />
 
+      {/* Featured: latest template as a block-square + full detail card.
+          The rest collapse below behind a "Browse all (N)" toggle. */}
       {templatesLoading ? (
         <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground animate-pulse">
           Loading template data...
         </div>
+      ) : latest ? (
+        <>
+          <FeaturedTemplate template={latest} />
+
+          <div className="rounded-lg border bg-card p-4">
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 text-left"
+              onClick={() => setMoreTemplatesOpen(!moreTemplatesOpen)}
+            >
+              <ChevronDown
+                className={`h-5 w-5 transition-transform ${moreTemplatesOpen ? "" : "-rotate-90"}`}
+              />
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Browse all templates ({otherCount})
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Every block template our stratum has registered on chain
+                </p>
+              </div>
+            </button>
+            {moreTemplatesOpen && (
+              <div className="mt-4">
+                <TemplateTable excludeId={latest.id} />
+              </div>
+            )}
+          </div>
+        </>
       ) : (
+        <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">
+          No templates registered yet
+        </div>
+      )}
+
+      {!templatesLoading && (
         <div className="rounded-lg border bg-card p-4">
           <button
             type="button"
@@ -96,8 +142,6 @@ export function PoolOverviewTab() {
           )}
         </div>
       </div>
-
-      <TemplateTable />
     </div>
   );
 }

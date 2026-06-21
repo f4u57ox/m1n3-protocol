@@ -29,8 +29,11 @@ function labelBytesToString(label: unknown): string {
 }
 
 function labelToFullType(label: string): string {
-  // "HS000" → "<pkg>::hs_000::HS_000"
-  const m = label.match(/^HS(\d+)$/);
+  // "HS000" or "HS_000" → "<pkg>::hs_000::HS_000". Both forms are
+  // produced in the wild — testnet/devnet rounds were registered as
+  // "HS000", but mainnet's register-slots script set labels to "HS_000"
+  // matching the file/module naming convention. Accept either.
+  const m = label.match(/^HS_?(\d+)$/);
   if (!m) return "";
   return `${PACKAGE_ID}::hs_${m[1]}::HS_${m[1]}`;
 }

@@ -10,6 +10,37 @@ export const ORIGINAL_PACKAGE_ID =
   process.env.NEXT_PUBLIC_ORIGINAL_PACKAGE_ID ??
   '0xdf7cc2d80454cd56818e58e727b48beb2f8c441fcf6e4f46fd2282d24427a895';
 
+/**
+ * Origin package id for the **V1** buyer-template lane structs/events
+ * (HashpowerBuyOrder, DerivedTemplate, HashpowerBuyOrderPlaced, …).
+ * These were first declared in the v2 upgrade and — per Sui Move's
+ * type-origin rule — their type tags stay bound to that package id
+ * forever, even after v3+ upgrades. Used for event filters and object
+ * type-prefix matching on /orders.
+ *
+ * Falls back to PACKAGE_ID for first-publish networks (testnet/devnet)
+ * where the lane was published in the original.
+ */
+export const HASHPOWER_LANE_PACKAGE_ID =
+  process.env.NEXT_PUBLIC_HASHPOWER_LANE_PACKAGE_ID ??
+  process.env.NEXT_PUBLIC_PACKAGE_ID ??
+  '';
+
+/**
+ * Origin package id for the **V2** buyer-BOUND lane structs/events
+ * (`BuyerHashpowerOrder`, `BuyerHashpowerOrderPlaced`, …). These were
+ * first declared in the v4 upgrade — orders are no longer pinned to a
+ * specific Template; they bind to the buyer's address and accept shares
+ * against any template the buyer owns.
+ *
+ * Defaults to PACKAGE_ID so on testnet/devnet (single-publish) the V2
+ * structs live in the original package and discovery still works.
+ */
+export const HASHPOWER_LANE_V2_PACKAGE_ID =
+  process.env.NEXT_PUBLIC_HASHPOWER_LANE_V2_PACKAGE_ID ??
+  process.env.NEXT_PUBLIC_PACKAGE_ID ??
+  '';
+
 /** Sui RPC URL — defaults to the public mainnet fullnode. */
 export const SUI_RPC_URL =
   process.env.NEXT_PUBLIC_SUI_RPC_URL ?? 'https://fullnode.mainnet.sui.io:443';

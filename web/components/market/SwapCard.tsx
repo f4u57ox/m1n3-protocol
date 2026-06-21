@@ -6,6 +6,11 @@ import type { ShareMarketOrder } from "@/hooks/useShareMarketOrders";
 import { useHashprice } from "@/hooks/useHashprice";
 import { QuoteSelector } from "@/components/market/QuoteSelector";
 import type { QuoteToken } from "@/lib/quote-tokens";
+import {
+  baseUnitLabel,
+  formatPriceInQuote,
+  parseQuoteAmount,
+} from "@/lib/quote-format";
 
 type Side = "buy" | "sell";
 type Tab = "swap" | "limit" | "dca";
@@ -149,7 +154,7 @@ function SwapTab(p: SwapCardProps) {
       const pay = BigInt(payAmount);
       if (side === "buy" && projection.totalQuote < pay) {
         const leftover = pay - projection.totalQuote;
-        return `${leftover.toString()} MIST unfilled — book exhausted at this size`;
+        return `${leftover.toString()} ${baseUnitLabel(p.quote)} unfilled — book exhausted at this size`;
       }
       if (side === "sell" && projection.totalUnits < pay) {
         const leftover = pay - projection.totalUnits;
@@ -170,7 +175,7 @@ function SwapTab(p: SwapCardProps) {
   const QUOTE: SwapAssetMeta = {
     symbol: p.quote.symbol,
     short: p.quote.symbol,
-    helper: p.quote.symbol === "SUI" ? "MIST" : `base ${p.quote.decimals}d`,
+    helper: baseUnitLabel(p.quote),
   };
   const HS: SwapAssetMeta = {
     symbol: p.hsLabel,
@@ -250,7 +255,7 @@ function SwapTab(p: SwapCardProps) {
         effectivePrice={effectivePrice}
         legCount={legCount}
         hsLabel={p.hsLabel}
-        quoteSymbol={p.quote.symbol}
+        quote={p.quote}
         helper={helper}
       />
 
@@ -271,57 +276,70 @@ function SwapTab(p: SwapCardProps) {
 
 function LimitTab(p: SwapCardProps) {
   const [side, setSide] = useState<Side>("buy");
+  // `price` is the user-facing DECIMAL string ("0.000017"), not base units.
+  // We convert to a u64 in `quote.decimals` base units inside `place()`
+  // via `parseQuoteAmount`. `qty` stays an integer string (HashShare counts).
   const [price, setPrice] = useState("");
   const [qty, setQty] = useState("");
-  // Live PPS-derived reference: MIST/HashShare unit. Only meaningful when
-  // SUI is the quote (other tokens route through DeepBook).
+  // Live PPS-derived reference: base units of quote per HashShare unit.
+  // Only meaningful when SUI is the quote today (other tokens route
+  // through DeepBook).
   const { fairMistPerShareUnit, satsPerDelta } = useHashprice();
 
-  const referenceMist = useMemo(() => {
+  const referenceBase = useMemo(() => {
     if (!fairMistPerShareUnit || p.quote.symbol !== "SUI") return null;
-    // Round to nearest integer MIST. Tiny values render as 0 — guard.
+    // Round to nearest integer base unit. Tiny values render as 0 — guard.
     const rounded = Math.max(1, Math.round(fairMistPerShareUnit));
     return BigInt(rounded);
   }, [fairMistPerShareUnit, p.quote.symbol]);
 
+  // Pre-parse the price input once so notional + slippage + place() share
+  // a single bigint conversion.
+  const priceBaseUnits = useMemo(
+    () => parseQuoteAmount(price, p.quote),
+    [price, p.quote],
+  );
+
   const notional = useMemo(() => {
+    if (priceBaseUnits === null) return 0n;
     try {
-      const pr = BigInt(price || "0");
       const q = BigInt(qty || "0");
-      return pr * q;
+      return priceBaseUnits * q;
     } catch {
       return 0n;
     }
-  }, [price, qty]);
+  }, [priceBaseUnits, qty]);
 
   // % above/below the hashprice reference
   const slippageVsHashprice = useMemo(() => {
-    if (!referenceMist || referenceMist === 0n || !price) return null;
-    try {
-      const pr = BigInt(price);
-      if (pr === 0n) return null;
-      const diff = Number(pr) - Number(referenceMist);
-      return (diff / Number(referenceMist)) * 100;
-    } catch {
+    if (!referenceBase || referenceBase === 0n || priceBaseUnits === null) {
       return null;
     }
-  }, [price, referenceMist]);
+    if (priceBaseUnits === 0n) return null;
+    const diff = Number(priceBaseUnits) - Number(referenceBase);
+    return (diff / Number(referenceBase)) * 100;
+  }, [priceBaseUnits, referenceBase]);
 
   function place() {
-    if (!price || !qty) return;
-    const pr = BigInt(price);
-    const q = BigInt(qty);
+    if (priceBaseUnits === null || !qty) return;
+    let q: bigint;
+    try {
+      q = BigInt(qty);
+    } catch {
+      return;
+    }
+    if (priceBaseUnits === 0n || q === 0n) return;
     if (side === "buy") {
-      // For a bid, budget = price × qty (the max amount of SUI we'd spend).
-      p.onPlaceBid(pr, pr * q);
+      // For a bid, budget = price × qty (the max amount of quote we'd spend).
+      p.onPlaceBid(priceBaseUnits, priceBaseUnits * q);
     } else {
-      p.onPlaceAsk(pr, q);
+      p.onPlaceAsk(priceBaseUnits, q);
     }
   }
 
   const ctaLabel = !p.walletConnected
     ? "Connect wallet"
-    : !price || !qty
+    : priceBaseUnits === null || !qty
       ? "Enter price and quantity"
       : side === "buy"
         ? `Place buy order`
@@ -362,10 +380,22 @@ function LimitTab(p: SwapCardProps) {
       </div>
 
       {/* Hashprice reference — only meaningful when SUI is the quote */}
-      {referenceMist != null && (
+      {referenceBase != null && (
         <button
           type="button"
-          onClick={() => setPrice(referenceMist.toString())}
+          onClick={() => {
+            // Pre-fill the input with the *decimal* form (matches the
+            // user-facing units). e.g. 1 MIST → "0.000000001".
+            const dec = p.quote.decimals;
+            const factor = BigInt(10) ** BigInt(dec);
+            const whole = referenceBase / factor;
+            const frac = referenceBase % factor;
+            const fracStr = frac
+              .toString()
+              .padStart(dec, "0")
+              .replace(/0+$/, "");
+            setPrice(fracStr ? `${whole}.${fracStr}` : whole.toString());
+          }}
           className="group flex w-full items-center justify-between gap-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 px-3 py-2.5 text-left transition-colors hover:bg-emerald-500/10 sm:px-4"
         >
           <span className="flex min-w-0 items-center gap-2 sm:gap-2.5">
@@ -376,9 +406,9 @@ function LimitTab(p: SwapCardProps) {
               </span>
               <span className="font-mono text-xs sm:text-sm tabular-nums">
                 <span className="text-foreground">
-                  {referenceMist.toString()}
+                  {formatPriceInQuote(referenceBase, p.quote)}
                 </span>
-                <span className="text-muted-foreground"> MIST/unit</span>
+                <span className="text-muted-foreground">/unit</span>
                 {satsPerDelta != null && (
                   <span className="text-muted-foreground/70">
                     {" "}
@@ -397,10 +427,18 @@ function LimitTab(p: SwapCardProps) {
       {/* price */}
       <LabeledNumericInput
         label="Limit price"
-        suffix={`${p.quote.symbol}/unit (MIST)`}
+        suffix={`${p.quote.symbol}/unit`}
         value={price}
         onChange={setPrice}
-        placeholder={referenceMist != null ? referenceMist.toString() : "0"}
+        allowDecimal
+        placeholder={
+          referenceBase != null
+            ? formatPriceInQuote(referenceBase, p.quote).replace(
+                ` ${p.quote.symbol}`,
+                "",
+              )
+            : "0"
+        }
         rightHelper={
           slippageVsHashprice != null
             ? `${slippageVsHashprice > 0 ? "+" : ""}${slippageVsHashprice.toFixed(1)}% vs hashprice`
@@ -431,7 +469,7 @@ function LimitTab(p: SwapCardProps) {
       <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3 text-xs">
         <Row label="Notional">
           <span className="font-mono">
-            {notional === 0n ? "—" : `${formatMist(notional)} ${p.quote.symbol}`}
+            {notional === 0n ? "—" : formatPriceInQuote(notional, p.quote)}
           </span>
         </Row>
         <Row label="Side">
@@ -575,7 +613,7 @@ function SwapDetails({
   effectivePrice,
   legCount,
   hsLabel,
-  quoteSymbol,
+  quote,
   helper,
 }: {
   side: Side;
@@ -583,16 +621,17 @@ function SwapDetails({
   effectivePrice: bigint;
   legCount: number;
   hsLabel: string;
-  quoteSymbol: string;
+  quote: QuoteToken;
   helper: string;
 }) {
   const [open, setOpen] = useState(false);
+  const quoteSymbol = quote.symbol;
   const summary = (() => {
     if (effectivePrice > 0n) {
-      return `Avg price · ${effectivePrice.toString()} MIST/${hsLabel} · ${legCount} leg${legCount === 1 ? "" : "s"}`;
+      return `Avg price · ${formatPriceInQuote(effectivePrice, quote)}/${hsLabel} · ${legCount} leg${legCount === 1 ? "" : "s"}`;
     }
     if (topPrice > 0n) {
-      return `Best price · ${topPrice.toString()} MIST/${hsLabel}`;
+      return `Best price · ${formatPriceInQuote(topPrice, quote)}/${hsLabel}`;
     }
     return "No price data";
   })();
@@ -631,14 +670,14 @@ function SwapDetails({
           {topPrice > 0n && (
             <Row label="Top of book">
               <span className="font-mono">
-                {topPrice.toString()} MIST/{hsLabel}
+                {formatPriceInQuote(topPrice, quote)}/{hsLabel}
               </span>
             </Row>
           )}
           {effectivePrice > 0n && (
             <Row label="Effective price">
               <span className="font-mono">
-                {effectivePrice.toString()} MIST/{hsLabel}
+                {formatPriceInQuote(effectivePrice, quote)}/{hsLabel}
               </span>
             </Row>
           )}
@@ -718,6 +757,7 @@ function LabeledNumericInput({
   placeholder,
   rightHelper,
   onMax,
+  allowDecimal = false,
 }: {
   label: string;
   suffix: string;
@@ -726,6 +766,9 @@ function LabeledNumericInput({
   placeholder?: string;
   rightHelper?: string;
   onMax?: () => void;
+  /** When set, the input accepts a single `.` for decimal entry. Off by
+   *  default so quantity/budget fields stay integer-only. */
+  allowDecimal?: boolean;
 }) {
   return (
     <div className="rounded-2xl border border-border/60 bg-muted/15 px-4 py-3">
@@ -747,9 +790,22 @@ function LabeledNumericInput({
       </div>
       <div className="mt-2 flex items-center justify-between gap-3">
         <input
-          inputMode="numeric"
+          inputMode={allowDecimal ? "decimal" : "numeric"}
           value={value}
-          onChange={(e) => onChange(e.target.value.replace(/[^0-9]/g, ""))}
+          onChange={(e) => {
+            const raw = e.target.value;
+            if (allowDecimal) {
+              // Allow ASCII digits and one decimal point. The second
+              // pass strips any further dots the user types after the
+              // first is already present.
+              const cleaned = raw
+                .replace(/[^0-9.]/g, "")
+                .replace(/(\..*)\./g, "$1");
+              onChange(cleaned);
+            } else {
+              onChange(raw.replace(/[^0-9]/g, ""));
+            }
+          }}
           placeholder={placeholder ?? "0"}
           className="min-w-0 flex-1 bg-transparent font-mono text-2xl sm:text-3xl text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
         />

@@ -3,6 +3,33 @@
 import { useMemo } from "react";
 import type { ShareMarketOrder } from "@/hooks/useShareMarketOrders";
 import { useHashprice } from "@/hooks/useHashprice";
+import type { QuoteToken } from "@/lib/quote-tokens";
+import { baseUnitLabel, formatPriceInQuote } from "@/lib/quote-format";
+
+/**
+ * Small "is this stablecoin $1" registry. Anything in here is treated as
+ * 1 quote unit = $1 (USD). For everything else (SUI, ETH, etc.) we fall
+ * back to the live spot price from `useHashprice` when we have it.
+ */
+const USD_PEGGED = new Set(["USDC", "DUSDC", "USDT", "USDY", "DBUSDC", "DBUSDT"]);
+
+/** Price × quantity → notional in USD, network-rate-aware. Returns null if
+ *  we don't have a usable rate (e.g. SUI but suiPrice not yet loaded). */
+function notionalUsd(
+  priceBaseUnits: bigint,
+  units: bigint,
+  quote: QuoteToken,
+  suiPrice: number | null,
+): number | null {
+  const totalBase = Number(priceBaseUnits * units);
+  const quoteAmount = totalBase / 10 ** quote.decimals;
+  if (USD_PEGGED.has(quote.symbol)) return quoteAmount;
+  if (quote.symbol === "SUI") {
+    if (!suiPrice || suiPrice <= 0) return null;
+    return quoteAmount * suiPrice;
+  }
+  return null;
+}
 
 /**
  * Compact orderbook + my-orders side rail. Asks first (top, red), bids second
@@ -16,12 +43,14 @@ export function OrderBookSidebar({
   loading,
   myAddress,
   onCancel,
+  quote,
 }: {
   bids: ShareMarketOrder[];
   asks: ShareMarketOrder[];
   loading: boolean;
   myAddress?: string;
   onCancel?: (order: ShareMarketOrder) => void;
+  quote: QuoteToken;
 }) {
   const mine = useMemo(
     () =>
@@ -44,9 +73,10 @@ export function OrderBookSidebar({
             <Side
               orders={asks.slice().reverse().slice(-10)}
               side="ask"
+              quote={quote}
             />
-            <Spread bids={bids} asks={asks} />
-            <Side orders={bids.slice(0, 10)} side="bid" />
+            <Spread bids={bids} asks={asks} quote={quote} />
+            <Side orders={bids.slice(0, 10)} side="bid" quote={quote} />
           </>
         )}
       </div>
@@ -62,7 +92,7 @@ export function OrderBookSidebar({
             You have no open orders on this round.
           </div>
         ) : (
-          <MyOrdersList orders={mine} onCancel={onCancel} />
+          <MyOrdersList orders={mine} onCancel={onCancel} quote={quote} />
         )}
       </div>
     </div>
@@ -72,14 +102,15 @@ export function OrderBookSidebar({
 function MyOrdersList({
   orders,
   onCancel,
+  quote,
 }: {
   orders: ShareMarketOrder[];
   onCancel?: (o: ShareMarketOrder) => void;
+  quote: QuoteToken;
 }) {
   const { suiPrice } = useHashprice();
   function totalUsd(o: ShareMarketOrder): number | null {
-    if (!suiPrice || suiPrice <= 0) return null;
-    return (Number(o.pricePerUnitMist * o.maxUnits) / 1e9) * suiPrice;
+    return notionalUsd(o.pricePerUnitMist, o.maxUnits, quote, suiPrice);
   }
   return (
     <ul className="divide-y divide-border/40">
@@ -107,7 +138,7 @@ function MyOrdersList({
               <span className="text-[10px] text-muted-foreground">
                 {usd != null
                   ? `≈ ${formatUsd(usd)} total`
-                  : `${o.pricePerUnitMist} MIST/unit`}
+                  : `${o.pricePerUnitMist} ${baseUnitLabel(quote)}/unit`}
               </span>
             </div>
             {onCancel && (
@@ -138,9 +169,11 @@ function Header({ label }: { label: string }) {
 function Side({
   orders,
   side,
+  quote,
 }: {
   orders: ShareMarketOrder[];
   side: "bid" | "ask";
+  quote: QuoteToken;
 }) {
   const max = useMemo(
     () =>
@@ -159,36 +192,32 @@ function Side({
     );
   }
 
-  return <SideRows orders={orders} side={side} max={max} />;
+  return <SideRows orders={orders} side={side} max={max} quote={quote} />;
 }
 
 function SideRows({
   orders,
   side,
   max,
+  quote,
 }: {
   orders: ShareMarketOrder[];
   side: "bid" | "ask";
   max: bigint;
+  quote: QuoteToken;
 }) {
   const { suiPrice } = useHashprice();
-  // Convert price (MIST/unit) → USD/unit via live SUI price. Returns
-  // null when the rate isn't ready yet so the UI can fall back to MIST.
-  function priceUsd(priceMist: bigint): number | null {
-    if (!suiPrice || suiPrice <= 0) return null;
-    return (Number(priceMist) / 1e9) * suiPrice;
-  }
-
   return (
     <ul className="px-1 py-1.5">
       <li className="grid grid-cols-[1fr_auto_auto] gap-2 px-3 pb-1 text-[10px] font-mono uppercase tracking-wider text-muted-foreground">
-        <span>price (USD/unit)</span>
+        <span>price ({quote.symbol}/unit)</span>
         <span className="text-right">size · units</span>
         <span className="w-16 text-right">depth</span>
       </li>
       {orders.map((o) => {
         const pct = max > 0n ? Number((o.maxUnits * 100n) / max) : 0;
-        const usd = priceUsd(o.pricePerUnitMist);
+        const usd = notionalUsd(o.pricePerUnitMist, 1n, quote, suiPrice);
+        const priceStr = formatPriceInQuote(o.pricePerUnitMist, quote);
         return (
           <li
             key={o.objectId}
@@ -206,9 +235,10 @@ function SideRows({
                 side === "bid" ? "text-emerald-400" : "text-rose-400"
               }`}
             >
-              <span>{usd != null ? formatUsd(usd) : `${o.pricePerUnitMist} MIST`}</span>
+              <span>{priceStr}</span>
               <span className="text-[9px] text-muted-foreground/70">
-                {o.pricePerUnitMist.toString()} MIST
+                {o.pricePerUnitMist.toString()} {baseUnitLabel(quote)}
+                {usd != null && ` · ≈ ${formatUsd(usd)}`}
               </span>
             </span>
             <span className="relative text-right tabular-nums">
@@ -243,9 +273,11 @@ function formatUsd(n: number): string {
 function Spread({
   bids,
   asks,
+  quote,
 }: {
   bids: ShareMarketOrder[];
   asks: ShareMarketOrder[];
+  quote: QuoteToken;
 }) {
   const { suiPrice } = useHashprice();
   const topBid = bids[0]?.pricePerUnitMist ?? 0n;
@@ -259,13 +291,13 @@ function Spread({
   }
   const spread = topAsk - topBid;
   const pct = Number((spread * 10000n) / topAsk) / 100;
-  const spreadUsd =
-    suiPrice && suiPrice > 0 ? (Number(spread) / 1e9) * suiPrice : null;
+  const spreadUsd = notionalUsd(spread, 1n, quote, suiPrice);
   return (
     <div className="border-y border-border/40 bg-muted/20 px-4 py-2 text-center font-mono text-[10px] uppercase tracking-[0.2em]">
       <span className="text-muted-foreground">spread</span>{" "}
       <span className="text-foreground">
-        {spreadUsd != null ? formatUsd(spreadUsd) : `${spread} MIST`}
+        {formatPriceInQuote(spread, quote)}
+        {spreadUsd != null && ` · ≈ ${formatUsd(spreadUsd)}`}
       </span>{" "}
       <span className="text-muted-foreground">({pct.toFixed(2)}%)</span>
     </div>
