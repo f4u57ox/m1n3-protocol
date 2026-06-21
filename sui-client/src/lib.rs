@@ -690,7 +690,39 @@ impl MinerClient {
             }
         }
 
+        // ── Diagnostic pre-flight log ─────────────────────────────────
+        //
+        // Logs every input that participates in on-chain validation so a
+        // failed batch can be triaged from a single log line. Mirrors the
+        // same trace we added on the buyer-template lane.
+        let unique_templates_csv = unique_templates.join(",");
+        info!(
+            "submit_share PTB pre-submit — sender={} templates_in_batch=[{}] shares={}",
+            self.address,
+            unique_templates_csv,
+            batch.len()
+        );
+
         let resp = self.exec(ptb.finish()).await?;
+
+        // ── Post-execute status check ─────────────────────────────────
+        //
+        // `self.exec` returns the response even when the Move call aborts
+        // (Sui treats an abort as a "successful tx with Failure status").
+        // Without this check the caller silently sees a digest while the
+        // share didn't actually land. Surface the abort code as an Err so
+        // `flush()` logs the real reason.
+        if let Some(eff) = &resp.effects {
+            use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
+            if let SuiExecutionStatus::Failure { error } = eff.status() {
+                return Err(anyhow!(
+                    "submit_share aborted on chain: {} (digest: {})",
+                    error,
+                    resp.digest
+                ));
+            }
+        }
+
         self.update_from_resp(&resp);
         Ok(resp.digest.to_string())
     }

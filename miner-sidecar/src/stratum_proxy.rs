@@ -226,6 +226,28 @@ async fn batch_flusher(
     }
 }
 
+/// Heuristic: does an `anyhow::Error` from the Sui SDK look like a transient
+/// RPC issue (timeout, connection reset, fullnode unreachable) rather than
+/// a Move-execution abort? Used to decide whether to requeue the share or
+/// drop it.
+///
+/// The buyer-pay and operator paths both wrap their errors with explicit
+/// "aborted on chain" prefixes when the tx executed and aborted on a Move
+/// check — that string disambiguates a permanent failure from the
+/// underlying SDK's connection-level errors.
+fn is_transient_rpc_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    if s.contains("aborted on chain") {
+        // Move abort — permanent. Retrying wouldn't help.
+        return false;
+    }
+    s.contains("timeout")
+        || s.contains("connection reset")
+        || s.contains("connection refused")
+        || s.contains("transport error")
+        || s.contains("decode error")
+}
+
 async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) {
     if batch.is_empty() {
         return;
@@ -244,7 +266,20 @@ async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) 
                 "Buyer-bound batch of {} share(s) confirmed (Coin<QuoteT> → miner): {}",
                 n, digest
             ),
-            Err(e) => warn!("Buyer-bound batch submission failed: {}", e),
+            Err(e) => {
+                if is_transient_rpc_error(&e) {
+                    warn!(
+                        "Buyer-bound batch transient RPC error, requeuing {} share(s): {}",
+                        n, e
+                    );
+                    batch.extend(items);
+                } else {
+                    warn!(
+                        "Buyer-bound batch submission failed (dropping {} share(s)): {}",
+                        n, e
+                    );
+                }
+            }
         }
         return;
     }
@@ -283,7 +318,27 @@ async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) 
                 }
             }
         }
-        Err(e) => warn!("Batch submission failed: {}", e),
+        Err(e) => {
+            if is_transient_rpc_error(&e) {
+                // Transient RPC flakiness (Sui mainnet fullnode can take
+                // longer than the SDK's HTTP timeout under load). Don't
+                // drop the share — put the batch back so the next flush
+                // ticker retries it.
+                warn!(
+                    "Batch transient RPC error, requeuing {} share(s) for retry: {}",
+                    n, e
+                );
+                batch.extend(items);
+            } else {
+                // Move-execution failure or other permanent error — the
+                // tx genuinely won't settle. Dropping is correct;
+                // retrying would just abort again.
+                warn!(
+                    "Batch submission failed (dropping {} share(s)): {}",
+                    n, e
+                );
+            }
+        }
     }
 }
 
