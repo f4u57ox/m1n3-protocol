@@ -9,7 +9,7 @@ The BTC reward address is a deterministic function of a Sui object's UID —
 nobody chooses it, not even the operator.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Sui Network](https://img.shields.io/badge/Sui-testnet-4DA2FF.svg)](https://suiscan.xyz/testnet/object/0xbbe3ff9d383e3987dfd6acfcd6ff6ad12fa330011323aa753604c722886049b9)
+[![Sui Network](https://img.shields.io/badge/Sui-mainnet-4DA2FF.svg)](https://suiscan.xyz/mainnet/object/0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2)
 [![Move package](https://img.shields.io/badge/package-m1n3__v4-orange.svg)](contracts/Published.toml)
 [![Sui Overflow 2026](https://img.shields.io/badge/Sui_Overflow-2026_·_DeFi_%26_Payments-9333ea.svg)](https://mystenlabs.notion.site/defi-payments-problem-statement)
 
@@ -117,21 +117,70 @@ A second on-chain rail (V3 + V4 upgrades) lets buyers fund USDC orders that pay 
 
 The `stratum-server` binary doubles as the buyer's full node: clear `POOL_ADMIN_CAP` and set `SUI_ADDRESS` to the buyer wallet, and templates auto-register via `register_template_public` (0.01 SUI fee per template, `Template.owner = buyer`). Both order kinds appear side-by-side on `/marketplace?tab=private` with a V1/V2 chip and inline cancel / re-price / top-up actions for the order's buyer. See [`CLAUDE.md`](./CLAUDE.md#7-buyer-template-lane) for the full surface (entries, ops binaries, `ProtocolMPCConfig`).
 
+## Requirements
+
+To run the protocol end-to-end you need:
+
+| Layer | What | Notes |
+|---|---|---|
+| **Bitcoin full node** (`bitcoind`) | Source of `getblocktemplate`; broadcasts blocks found by miners | Mainnet for production, signet for the Hashi devnet integration. Pruning to ~50 GB is fine — we don't need historical blocks. Open the RPC port (8332 mainnet / 38332 signet) to the stratum-server. |
+| **Sui CLI + keypair** | Signs template registrations, share submissions, round-close PTBs, lifecycle entries | `sui client switch --env mainnet`; keystore at `~/.sui/sui_config/sui.keystore`. Hold ≥ 5 SUI for gas plus 0.01 SUI per buyer-mode template registration. |
+| **Sui RPC endpoint** | All PTBs go through it. Mysten's public fullnode (`https://fullnode.mainnet.sui.io:443`) works but is heavily loaded and can stall per-share txs at the SDK's default 60 s timeout. | Running your own Sui fullnode or pointing at a paid endpoint (Triton/RPCPool, BlockVision, etc.) is strongly recommended for any production share traffic. |
+| **`stratum-server`** | Stratum v1 endpoint on `:3333`. Pulls templates from bitcoind, validates shares locally (sub-ms), registers each fresh Template on Sui under `Template.owner = <signer>`. | One Rust binary. Runs as protocol operator (admin cap set) or as a private buyer (cap empty) — same binary, different env. |
+| **`miner-sidecar`** | Trustless proxy on `:3334` that ASICs point at instead of the stratum directly. Each accepted share becomes a Sui tx signed by the miner's own Sui key, batched and submitted with retry-on-timeout. | Required whenever the ASIC can't hold a Sui keypair (which is approximately all of them). |
+| **Hardware miner / ASIC** | Computes the actual SHA-256d work | Anything that speaks Stratum v1: Avalon Nano, Bitaxe, S19-class, etc. Configure to connect to `stratum+tcp://<sidecar-host>:3334`, username `<your-sui-address>.<worker>`. Extranonce1 is derived deterministically from the Sui address. |
+| **Web dapp** (optional) | Dashboard for templates / shares / rewards / marketplace / OTC / hedge, served as a Next.js static export | Build with `npm run build` from `web/`, deploy `out/` to any Apache/CDN. A `.htaccess` for cPanel-style hosting is included. |
+| **Network** | Open Stratum v1 (`:3334`) to your ASIC's LAN. Outbound HTTPS to Sui RPC + Bitcoin RPC. | Sidecar listens on `0.0.0.0:3334` by default so devices on the same LAN can connect. |
+| **Storage** | ~700 GB for a fully-validated bitcoind (or ~50 GB pruned), ~2 GB for the Rust workspace builds, ~1 GB for `web/node_modules` + build artifacts. |  |
+
+For a single-rig solo setup the minimum viable bundle is: one bitcoind + one stratum-server + one sidecar + one ASIC. The same software scales to a pool (many ASICs against one stratum) or to a buyer-side rig (private buyer running their own stratum + sidecar against a buyer-owned Sui wallet).
+
 ## What's deployed
 
-| Object | Testnet ID | Network |
-|---|---|---|
-| `m1n3_v4` package | [`0xbbe3ff9d…886049b9`](https://suiscan.xyz/testnet/object/0xbbe3ff9d383e3987dfd6acfcd6ff6ad12fa330011323aa753604c722886049b9) | testnet |
-| `Pool` shared object | [`0x1cccd375…b0156f1f`](https://suiscan.xyz/testnet/object/0x1cccd3752f85eaecfe6f1bea637a9be8e61a656cfa2f516dddd29571b0156f1f) | testnet |
-| `MarketFeePool` | [`0x4d3da2e4…0bba08f9`](https://suiscan.xyz/testnet/object/0x4d3da2e4607ebe2be6068e3f157b88b8d025754bbf54b653d5bf61210bba08f9) | testnet |
-| `HashShareRegistry` | [`0x780d2dcc…2df34f30`](https://suiscan.xyz/testnet/object/0x780d2dcc6d4b68f3478dd2c881882d7b334d6855f88b751f8b828f2b2c384736a) | testnet |
-| `HashiRewardRegistry` | [`0x620e410c…efc4549d`](https://suiscan.xyz/testnet/object/0x620e410ccef57c0ab56b73d62742a51db1c112e6b333ef627f140f92db9a0045) | testnet |
-| `HashiVault<BTC>` (devnet) | [`0x816808e9…84c810db`](https://suiscan.xyz/devnet/object/0x816808e9ce5586771ac1125f3530bf62c3da5416ce58b11a373596e684c810db) | devnet |
+### Mainnet — live today
 
-Mainnet ID is in [`contracts/Published.toml`](contracts/Published.toml) once
-deployed. Hashi itself only lives on devnet today (per `MystenLabs/hashi`
-README); the m1n3 contracts are portable to any network where `hashi::deposit`
-is present.
+| Object | ID |
+|---|---|
+| `m1n3_v4` package | [`0x2b259838…b771f9fea2`](https://suiscan.xyz/mainnet/object/0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2) |
+| `Pool` shared object | [`0x7ca199ca…1e2bd73ba`](https://suiscan.xyz/mainnet/object/0x7ca199ca3fa3e107de9832f7b44b905154883fe3f617a420bf6cf4d1e2bd73ba) |
+| `MarketFeePool<USDC>` | [`0x9464795f…e99257e86`](https://suiscan.xyz/mainnet/object/0x9464795f5382c2336cd45de0f30185006a52c3a49df25c6fae7c39de99257e86) |
+| `HashShareRegistry` | [`0xffb857cf…48a532fb2`](https://suiscan.xyz/mainnet/object/0xffb857cfc50f8ba9bd9a0e67f22692f1162d8e137af4314f260963048a532fb2) |
+| `MinerRoundRegistry` | [`0xd887ce8a…f4cb37c84`](https://suiscan.xyz/mainnet/object/0xd887ce8a9b3ad2af7f4088ed7fa55b813b0c94f6ead2178c0379586f4cb37c84) |
+| `ProtocolMPCConfig` | [`0x84b1da14…686d472a48`](https://suiscan.xyz/mainnet/object/0x84b1da14bced4916a39c4a6047d0beac5b19df3f681faef62c13e2686d472a48) |
+| `HashiRewardRegistry` *(deployed but inert until Hashi mainnet)* | [`0x386970ab…6b8ea215a`](https://suiscan.xyz/mainnet/object/0x386970ab35d41761a3763284ec6d4b3fe9c921c622c31631262a9fd6b8ea215a) |
+
+**Live on mainnet:**
+
+- Pool, share submission, template registration (operator + buyer modes).
+- HashShare market and DeepBook V3 routing on the `/marketplace` public tab.
+- Buyer-template lane: V1 + V2 hashpower orders, `register_template_public`, `submit_share_for_buyer_pay`.
+- `ProtocolMPCConfig` registry — miners can verify the BTC payout `scriptPubKey` off-chain against an on-chain source of truth.
+
+**Not on mainnet yet** (gated on upstream):
+
+- **Hashi MPC bridge.** Hashi's mainnet committee isn't deployed yet — the project is devnet-only today (per `MystenLabs/hashi` README). The m1n3 `hashi_pool` / `hashi_vault` / `hashi_rewards` modules are compiled into the mainnet package and `HashiRewardRegistry` is already shared, but the `record_block_found` → `register_with_hashi` → `claim_reward<BTC>` pipeline is gated on a live Hashi committee that can custody the coinbase output. The instant Hashi lands on mainnet, the existing PTBs resolve against the mainnet vault with no contract changes.
+
+### Devnet (Hashi integration testbed)
+
+| Object | ID |
+|---|---|
+| `HashiVault<BTC>` | [`0x816808e9…684c810db`](https://suiscan.xyz/devnet/object/0x816808e9ce5586771ac1125f3530bf62c3da5416ce58b11a373596e684c810db) |
+
+### Testnet (DeepBook Predict hedge + legacy V1)
+
+| Object | ID |
+|---|---|
+| `m1n3` package (legacy V1) | [`0xbbe3ff9d…886049b9`](https://suiscan.xyz/testnet/object/0xbbe3ff9d383e3987dfd6acfcd6ff6ad12fa330011323aa753604c722886049b9) |
+
+Mainnet upgrade history is tracked in [`contracts/Published.toml`](contracts/Published.toml). The m1n3 contracts are portable to any network where `hashi::deposit` is present.
+
+## Roadmap
+
+Two integrations are designed and partially landed, both waiting on upstream Sui features:
+
+- **Confidential OTC for HashShare positions** — atomic on-chain settlement of `Coin<HS_NNN>` ↔ `Coin<DUSDC>` through the `m1n3_confidential_otc` escrow, with the eventual goal of hiding per-trade size on chain. Today's Phase A (devnet only) leaks the trade size on the escrow object. **Phase B flips on once Sui's upcoming private transactions feature ships on mainnet** — the same escrow PTB will route through a private-tx flow so neither leg of the swap is publicly indexable. The TypeScript bindings to [`MystenLabs/confidential-transfers`](https://github.com/MystenLabs/confidential-transfers) are already vendored and wired into the dapp; the swap to private mainnet txs is a one-line route change in `web/lib/otc.ts` once the API stabilises. See [`docs/otc.md`](docs/otc.md).
+- **Mining-revenue hedge via DeepBook Predict** — the `/hedge` page already chains `predict::create_manager` + `predict_manager::deposit<DUSDC>` + N×`predict::mint_range<DUSDC>` into one PTB and ships a Monte-Carlo proof that hedged variance < unhedged variance and that the 5th-percentile revenue lifts strictly. **Testnet only today, since DeepBook Predict itself is testnet-only.** Migrates to mainnet on Predict's mainnet release with no protocol-level code changes — the route reads its package/manager IDs from `NEXT_PUBLIC_DEEPBOOK_PREDICT_*` env. See [`docs/hedge.md`](docs/hedge.md).
+- **Hashi mainnet integration** — see the "Not on mainnet yet" note above. The on-chain Move code is already in the v4 package; the moment Hashi's mainnet committee opens, `record_block_found` → `claim_reward<BTC>` is hot with no upgrade required.
 
 ## Quick start
 
