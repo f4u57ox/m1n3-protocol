@@ -34,6 +34,35 @@ pub async fn run(args: Args) -> Result<()> {
         info!("MinerRoundRegistry wired: {}", mrr);
     }
 
+    if !args.quote_coin_type.is_empty() {
+        sender = sender.with_quote_type(&args.quote_coin_type)?;
+        info!("Quote coin type set: {}", args.quote_coin_type);
+    }
+
+    // Optional dynamic auto-sell floor (off-chain feeder). Lives behind
+    // an AtomicU64 so the price-feeder task can update it while
+    // batch_flusher reads it on every PTB build.
+    if args.auto_price_feeder {
+        let floor = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        sender = sender.with_dynamic_floor(floor.clone());
+        let cfg = crate::price_feeder::DynamicPriceConfig {
+            sui_rpc: args.sui_rpc.clone(),
+            package_id: args.sui_package.clone(),
+            price_api_url: args.auto_price_api_url.clone(),
+            refresh_secs: args.auto_price_refresh_secs,
+            multiplier_bps: args.auto_price_multiplier_bps,
+        };
+        info!(
+            "Dynamic price feeder enabled — refresh {}s, markup {}bps, api={}",
+            cfg.refresh_secs.max(15), cfg.multiplier_bps, cfg.price_api_url
+        );
+        tokio::spawn(async move {
+            if let Err(e) = crate::price_feeder::run(cfg, floor).await {
+                warn!("price feeder exited: {:?}", e);
+            }
+        });
+    }
+
     // Initial HashShare config (optional). The slot watcher below may
     // overwrite it as soon as the next `SlotBoundToRound` lands.
     if let (Some(reg), Some(cap), Some(ty)) = (
@@ -49,7 +78,7 @@ pub async fn run(args: Args) -> Result<()> {
         sender = sender.with_hashshare_mint(cfg);
     }
 
-    // Optional auto-sell. Activates only when --auto-sell-price-mist > 0.
+    // Optional auto-sell (fixed floor). Activates when --auto-sell-price-mist > 0.
     if args.auto_sell_price_mist > 0 {
         let asc = sui_client::AutoSellConfig {
             price_per_unit_mist: args.auto_sell_price_mist,
@@ -60,6 +89,53 @@ pub async fn run(args: Args) -> Result<()> {
             asc.price_per_unit_mist, asc.expires_at_ms,
         );
         sender = sender.with_auto_sell(asc);
+    }
+
+    // Optional peg-to-mid sell pricing. Overrides --auto-sell-price-mist when set.
+    if !args.auto_sell_peg.is_empty() {
+        let anchor: sui_client::PegAnchor = args.auto_sell_peg.parse()?;
+        let peg = sui_client::AutoSellPegConfig {
+            anchor,
+            offset_bps: args.auto_sell_offset_bps,
+            fallback_floor_mist: args.auto_sell_fallback_mist,
+            expires_at_ms: args.auto_sell_expires_ms,
+        };
+        info!(
+            "Auto-sell peg enabled — anchor={:?}, offset_bps={}, fallback_mist={}",
+            peg.anchor, peg.offset_bps, peg.fallback_floor_mist
+        );
+        sender = sender.with_auto_sell_peg(peg);
+    }
+
+    // Optional MarketFeePool — required by auto-fill mode.
+    sender = sender.with_market_fee_pool(&args.market_fee_pool)?;
+
+    // Optional buyer-template lane: drain a HashpowerBuyOrder per share.
+    // When set, the proxy's flush() routes through submit_share_for_pay
+    // instead of submit_share (HashShare mint + auto-sell short-circuited).
+    if !args.hashpower_buy_order_id.is_empty() {
+        info!(
+            "Buyer-template lane enabled — order={} quote={}",
+            args.hashpower_buy_order_id,
+            if args.quote_coin_type.is_empty() {
+                "0x2::sui::SUI"
+            } else {
+                args.quote_coin_type.as_str()
+            }
+        );
+        sender = sender.with_hashpower_buy_order(&args.hashpower_buy_order_id)?;
+    }
+
+    // Optional auto-fill-best-bid. Activates when --auto-fill-bid-floor-mist > 0.
+    if args.auto_fill_bid_floor_mist > 0 {
+        let cfg = sui_client::AutoFillBidConfig {
+            floor_price_mist: args.auto_fill_bid_floor_mist,
+        };
+        info!(
+            "Auto-fill-bid enabled — floor={} MIST/unit (fee_pool required)",
+            cfg.floor_price_mist
+        );
+        sender = sender.with_auto_fill_bid(cfg);
     }
 
     let (cfg_tx, cfg_rx) = mpsc::unbounded_channel::<HashShareMintConfig>();
@@ -156,15 +232,55 @@ async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) 
     }
     let items: Vec<(String, PendingShare)> = batch.drain(..).collect();
     let n = items.len();
+
+    // Buyer-template lane: when the sidecar is wired to a
+    // `HashpowerBuyOrder`, every share goes through
+    // `submit_share_for_pay<QuoteT>` and Coin<QuoteT> lands directly in
+    // the miner's wallet. HashShare mint + auto-sell + auto-fill all
+    // sit out — they don't apply to direct-pay shares.
+    if sender.hashpower_buy_config().is_some() {
+        match sender.submit_batch_for_buyer_pay(&items).await {
+            Ok(digest) => info!(
+                "Buyer-bound batch of {} share(s) confirmed (Coin<QuoteT> → miner): {}",
+                n, digest
+            ),
+            Err(e) => warn!("Buyer-bound batch submission failed: {}", e),
+        }
+        return;
+    }
+
     match sender.submit_batch(&items).await {
         Ok(digest) => {
             info!("Batch of {} share(s) confirmed: {}", n, digest);
-            // Auto-sell pass — no-op when --auto-sell-price-mist is 0 or the
-            // wallet holds no HashShares of the active slot.
-            match sender.auto_sell_minted().await {
-                Ok(Some(label)) => info!("Auto-sell placed: {}", label),
+            // Post-batch market action. Priority:
+            //   1. auto-fill-best-bid (Mode 3 — take an aggressive bid if one exists)
+            //   2. on no-fill, fall through to:
+            //       a. auto_sell_pegged (peg-to-mid)
+            //       b. auto_sell_minted (fixed-floor)
+            // Each step is a no-op when its config isn't set.
+            let mut filled = false;
+            match sender.auto_fill_best_bid().await {
+                Ok(Some(label)) => {
+                    info!("Auto-fill matched: {}", label);
+                    filled = true;
+                }
                 Ok(None) => {}
-                Err(e) => warn!("Auto-sell failed: {}", e),
+                Err(e) => warn!("Auto-fill failed: {}", e),
+            }
+            if !filled {
+                if sender.auto_sell_peg_config().is_some() {
+                    match sender.auto_sell_pegged().await {
+                        Ok(Some(label)) => info!("Auto-sell (pegged): {}", label),
+                        Ok(None) => {}
+                        Err(e) => warn!("Auto-sell pegged failed: {}", e),
+                    }
+                } else {
+                    match sender.auto_sell_minted().await {
+                        Ok(Some(label)) => info!("Auto-sell placed: {}", label),
+                        Ok(None) => {}
+                        Err(e) => warn!("Auto-sell failed: {}", e),
+                    }
+                }
             }
         }
         Err(e) => warn!("Batch submission failed: {}", e),

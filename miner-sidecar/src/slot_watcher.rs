@@ -124,12 +124,18 @@ fn parse_byte_array(v: &Value) -> Option<String> {
     v.as_str().map(|s| s.to_string())
 }
 
-/// Map a slot label like "HS000" to its fully-qualified Move type string.
+/// Map a slot label like "HS000" or "HS_000" to its fully-qualified Move
+/// type string. Both forms are produced in the wild — the upstream
+/// `hs_*.move` modules ship with display labels like "HS000" but the
+/// mainnet `register-mainnet-slots.sh` script set labels to "HS_000"
+/// (matching the file naming convention). Accept either.
 fn label_to_hashshare_type(package_id: &str, label: &str) -> Option<String> {
     if !label.starts_with("HS") {
         return None;
     }
-    let num = &label[2..];
+    let rest = &label[2..];
+    // Allow an optional underscore separator between "HS" and the digits.
+    let num = rest.strip_prefix('_').unwrap_or(rest);
     if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }

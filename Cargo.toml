@@ -7,10 +7,15 @@ members = [
     "hashi-derive",
     "trustless-keeper",
 ]
+exclude = [
+    # Vendored MystenLabs/confidential-transfers — has its own Rust crates
+    # (bulletproofs-wasm) that must build independently via wasm-pack.
+    "web/vendor",
+]
 resolver = "2"
 
 [workspace.dependencies]
-sui-sdk = { git = "https://github.com/MystenLabs/sui.git", package = "sui-sdk", rev = "a5f422e6ab3b3c6d14237fb54196321f42e017bf" }
+sui-sdk = { git = "https://github.com/MystenLabs/sui.git", package = "sui-sdk", rev = "1f6e1e6dd72dc75ac4037b3d4e38e73b133c5ef6" }  # mainnet-v1.73.2 — adds FundsWithdrawalArg / funds_withdrawal PTB command (address-balance support).
 bcs = "0.1"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

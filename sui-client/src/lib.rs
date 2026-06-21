@@ -10,11 +10,23 @@
 //! - Pool `current_round` cached with a 10-second TTL.
 //! - Gas coin ref refreshed from `object_changes` after each transaction.
 //! - True PTB batching: N shares → 1 transaction, 1 gas payment.
+//!
+//! ## Two share-submission paths
+//!
+//! - [`MinerClient::submit_batch`] — standard pool flow: per share, call
+//!   `pool::submit_share` and (optionally) chain `hash_share::mint_share_to<T>`
+//!   to mint the round's `Coin<HS_NNN>` to the miner.
+//! - [`MinerClient::submit_batch_for_buyer_pay`] — buyer-template lane: per
+//!   share, call `pool::submit_share_for_buyer_pay<QuoteT>` against the
+//!   configured `BuyerHashpowerOrder<QuoteT>` and `TransferObjects` the
+//!   returned `Coin<QuoteT>` straight to the miner inside the same PTB. The
+//!   sidecar selects this path when `--hashpower-buy-order-id` is set.
 
 use anyhow::{anyhow, Result};
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
+    sync::{atomic::AtomicU64, Arc},
     time::{Duration, Instant},
 };
 use sui_sdk::{
@@ -144,8 +156,72 @@ pub struct MinerClient {
     // `auto_sell_minted()` after every successful share batch:
     //   - merges all owned Coin<HashShare>
     //   - calls `hash_share_market::place_sell_order` at the configured floor
-    // Fill-best-bid is a future iteration; this is the place-only MVP.
     auto_sell: Option<AutoSellConfig>,
+
+    // Optional peg-to-market config. Overrides the fixed-floor auto_sell:
+    // computes a target price relative to the current best bid / mid / ask
+    // each batch, then either tops-up + retargets the miner's existing
+    // SellOrder or places a fresh one. See `AutoSellPegConfig`.
+    auto_sell_peg: Option<AutoSellPegConfig>,
+
+    // Optional auto-fill-bids config. When set, the sidecar scans the
+    // orderbook each batch for the best resting BuyOrder above floor and
+    // takes it via `hash_share_market::fill_buy_order`. Falls through to
+    // auto_sell (or auto_sell_peg) when no bid meets the floor.
+    auto_fill_bid: Option<AutoFillBidConfig>,
+
+    // Shared MarketFeePool object id, used as the `&fee_pool` arg on
+    // `fill_buy_order`. Required for auto-fill mode; ignored otherwise.
+    market_fee_pool_id: Option<ObjectID>,
+
+    // Quote coin type used by `hash_share_market` after the generic
+    // `<phantom T, phantom QuoteT>` refactor. Determines the second type
+    // argument on `place_sell_order` / `fill_buy_order` and the type tag
+    // appended to `BuyOrder<T, QuoteT>` event scans. Defaults to SUI for
+    // back-compat with testnet/devnet; mainnet sets this to native USDC.
+    quote_type: TypeTag,
+
+    // Dynamic auto-sell floor override (off-chain feeder, see
+    // `miner-sidecar/src/price_feeder.rs`). When set and > 0 this takes
+    // precedence over `AutoSellPegConfig.fallback_floor_mist`, letting
+    // the sidecar reprice every auto-sell batch against live BTC price +
+    // network difficulty. None disables the override and the static
+    // config value is used (current behavior). Phase B replaces this
+    // with an on-chain Pyth-anchored derivation in Move.
+    dynamic_floor_mist: Option<Arc<AtomicU64>>,
+
+    // Optional buyer-template lane configuration. When set, the sidecar
+    // calls `pool::submit_share_for_pay<QuoteT>` (or its derived variant)
+    // instead of the regular `submit_share` + HashShare mint. Each share
+    // drains `price_per_difficulty * difficulty` from the order's budget
+    // and the resulting `Coin<QuoteT>` is transferred to the miner inside
+    // the same PTB. No HashShare minting, no auto-sell, no round binding
+    // beyond what MinerRoundStats already requires.
+    hashpower_buy: Option<HashpowerBuyConfig>,
+}
+
+/// Buyer-bound (V2) lane config. The sidecar drains the configured
+/// `BuyerHashpowerOrder<QuoteT>` per share via
+/// `pool::submit_share_for_buyer_pay`. Unlike V1 there is no template
+/// binding on the order — any template `T` with `T.owner == order.buyer`
+/// can settle a share, so we don't need to resolve / cache an
+/// `order.template_id` here. The PTB threads the share's own template
+/// id, and the contract enforces owner-equality at submission time.
+#[derive(Clone, Debug)]
+pub struct HashpowerBuyConfig {
+    /// Shared mutable `BuyerHashpowerOrder<QuoteT>` to drain. The
+    /// `QuoteT` generic is read from `MinerClient.quote_type` so every
+    /// type tag stays in one place.
+    pub order_id: ObjectID,
+}
+
+impl HashpowerBuyConfig {
+    pub fn from_str(order_id: &str) -> Result<Self> {
+        Ok(Self {
+            order_id: ObjectID::from_str(order_id)
+                .map_err(|_| anyhow!("Invalid BuyerHashpowerOrder id: {}", order_id))?,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +230,52 @@ pub struct AutoSellConfig {
     pub price_per_unit_mist: u64,
     /// 0 = no expiry. Otherwise Unix-ms when the order auto-cancels.
     pub expires_at_ms: u64,
+}
+
+/// Peg-to-market price anchor. Resolution is left to the caller — we just
+/// pick which point in the orderbook the target price is relative to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PegAnchor {
+    /// (best_bid + best_ask) / 2. Falls back to the side that exists when
+    /// only one side is present, or to the configured floor when neither.
+    Mid,
+    /// Highest resting bid. Aggressive — sits at-touch.
+    BestBid,
+    /// Lowest resting ask minus one tick. Most passive.
+    BestAsk,
+}
+
+impl std::str::FromStr for PegAnchor {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "mid" => Ok(Self::Mid),
+            "bid" | "best-bid" | "best_bid" => Ok(Self::BestBid),
+            "ask" | "best-ask" | "best_ask" => Ok(Self::BestAsk),
+            other => Err(anyhow!(
+                "unknown peg anchor: {} (use mid|bid|ask)", other
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AutoSellPegConfig {
+    pub anchor: PegAnchor,
+    /// Signed basis-points offset from the anchor. +100 = +1% above; -50 = -0.5% below.
+    pub offset_bps: i32,
+    /// Floor in MIST/unit — used if the orderbook is empty so we never
+    /// give shares away for free. 0 means "skip the batch when no anchor".
+    pub fallback_floor_mist: u64,
+    /// 0 = no expiry. Otherwise Unix-ms when the order auto-cancels.
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutoFillBidConfig {
+    /// Minimum acceptable bid price in MIST/unit. Bids strictly below this
+    /// are skipped and we fall through to auto-sell.
+    pub floor_price_mist: u64,
 }
 
 impl MinerClient {
@@ -167,6 +289,32 @@ impl MinerClient {
             .map_err(|_| anyhow!("Invalid MinerRoundRegistry ID: {}", id_str))?;
         self.miner_round_registry_id = Some(id);
         Ok(self)
+    }
+
+    /// Override the quote coin type used by `place_sell_order` /
+    /// `fill_buy_order`. Default is SUI; mainnet sets this to native USDC.
+    /// Pass the fully-qualified type (e.g.
+    /// `"0xdba34672…::usdc::USDC"`).
+    pub fn with_quote_type(mut self, quote_type_str: &str) -> Result<Self> {
+        if quote_type_str.is_empty() {
+            return Ok(self);
+        }
+        self.quote_type = TypeTag::from_str(quote_type_str)
+            .map_err(|_| anyhow!("Invalid quote type tag: {}", quote_type_str))?;
+        Ok(self)
+    }
+
+    /// Install a shared atomic holding the dynamic auto-sell floor
+    /// (µUSDC per HashShare unit, on mainnet). When set and > 0 this
+    /// overrides `AutoSellPegConfig.fallback_floor_mist` on every batch.
+    /// A background task in the sidecar updates the atomic from the
+    /// fair-value derivation `(block_reward × btc_price) / difficulty`,
+    /// so prices track network conditions without restarting the
+    /// process. The atomic is set to 0 when the feeder has nothing
+    /// fresh — in that case we fall back to the static config.
+    pub fn with_dynamic_floor(mut self, floor: Arc<AtomicU64>) -> Self {
+        self.dynamic_floor_mist = Some(floor);
+        self
     }
 
     pub async fn new(
@@ -220,6 +368,16 @@ impl MinerClient {
             acc_check_at: None,
             hashshare: None,
             auto_sell: None,
+            auto_sell_peg: None,
+            auto_fill_bid: None,
+            market_fee_pool_id: None,
+            // SUI by default — back-compat with testnet/devnet markets.
+            // `with_quote_type` overrides this for USDC-quoted markets
+            // (mainnet).
+            quote_type: TypeTag::from_str("0x2::sui::SUI")
+                .expect("SUI type tag is well-known"),
+            dynamic_floor_mist: None,
+            hashpower_buy: None,
         })
     }
 
@@ -264,6 +422,77 @@ impl MinerClient {
 
     pub fn auto_sell_config(&self) -> Option<&AutoSellConfig> {
         self.auto_sell.as_ref()
+    }
+
+    /// Enable peg-to-market sell pricing. Overrides the fixed-floor
+    /// [`AutoSellConfig`] when both are set (peg is the more sophisticated
+    /// strategy).
+    pub fn with_auto_sell_peg(mut self, cfg: AutoSellPegConfig) -> Self {
+        self.auto_sell_peg = Some(cfg);
+        self
+    }
+    pub fn set_auto_sell_peg(&mut self, cfg: AutoSellPegConfig) {
+        self.auto_sell_peg = Some(cfg);
+    }
+    pub fn clear_auto_sell_peg(&mut self) {
+        self.auto_sell_peg = None;
+    }
+    pub fn auto_sell_peg_config(&self) -> Option<&AutoSellPegConfig> {
+        self.auto_sell_peg.as_ref()
+    }
+
+    /// Enable auto-fill-bids mode. The sidecar scans for resting bids
+    /// above the floor each batch; if it finds one, fills it via
+    /// `hash_share_market::fill_buy_order` and skips the auto-sell path.
+    pub fn with_auto_fill_bid(mut self, cfg: AutoFillBidConfig) -> Self {
+        self.auto_fill_bid = Some(cfg);
+        self
+    }
+    pub fn set_auto_fill_bid(&mut self, cfg: AutoFillBidConfig) {
+        self.auto_fill_bid = Some(cfg);
+    }
+    pub fn clear_auto_fill_bid(&mut self) {
+        self.auto_fill_bid = None;
+    }
+    pub fn auto_fill_bid_config(&self) -> Option<&AutoFillBidConfig> {
+        self.auto_fill_bid.as_ref()
+    }
+
+    /// Set the shared `MarketFeePool` object id used by `fill_buy_order`.
+    /// Required for auto-fill mode; pass an empty string for legacy modes.
+    pub fn with_market_fee_pool(mut self, id_str: &str) -> Result<Self> {
+        if id_str.is_empty() {
+            return Ok(self);
+        }
+        let id = ObjectID::from_str(id_str)
+            .map_err(|_| anyhow!("Invalid MarketFeePool ID: {}", id_str))?;
+        self.market_fee_pool_id = Some(id);
+        Ok(self)
+    }
+
+    /// Enable the buyer-template lane: every batch drains shares from
+    /// the configured `HashpowerBuyOrder<QuoteT>` via
+    /// `pool::submit_share_for_pay`. When set, `submit_batch` flips to
+    /// the pay-per-share PTB path; HashShare mint / auto-sell / auto-fill
+    /// are skipped because they're orthogonal to this lane.
+    pub fn with_hashpower_buy_order(mut self, id_str: &str) -> Result<Self> {
+        if id_str.is_empty() {
+            return Ok(self);
+        }
+        self.hashpower_buy = Some(HashpowerBuyConfig::from_str(id_str)?);
+        Ok(self)
+    }
+
+    pub fn set_hashpower_buy_order(&mut self, cfg: HashpowerBuyConfig) {
+        self.hashpower_buy = Some(cfg);
+    }
+
+    pub fn clear_hashpower_buy_order(&mut self) {
+        self.hashpower_buy = None;
+    }
+
+    pub fn hashpower_buy_config(&self) -> Option<&HashpowerBuyConfig> {
+        self.hashpower_buy.as_ref()
     }
 
     /// Ensure `MinerStats` exists; create it if missing. Call once at startup.
@@ -466,6 +695,201 @@ impl MinerClient {
         Ok(resp.digest.to_string())
     }
 
+    // ── Buyer-template lane: drain HashpowerBuyOrder per share ────────────────
+
+    /// Drains `HashpowerBuyOrder<QuoteT>.budget` per share via
+    /// `pool::submit_share_for_pay`. The returned `Coin<QuoteT>` is
+    /// transferred to the miner inside the same PTB so the wallet
+    /// accumulates payouts without any post-batch cleanup. Replaces
+    /// `submit_batch` when the client has a `HashpowerBuyConfig` — the
+    /// proxy's `flush` loop branches on `hashpower_buy_config().is_some()`.
+    pub async fn submit_batch_for_buyer_pay(
+        &mut self,
+        batch: &[(String, PendingShare)],
+    ) -> Result<String> {
+        if batch.is_empty() {
+            return Err(anyhow!("Empty batch"));
+        }
+
+        // Bootstrap owned objects the same way `submit_batch` does. The
+        // V2 buyer-bound lane uses MinerRoundStats's existing round_id —
+        // there's no separate "buyer round" — so we just accumulate
+        // work into whatever round the miner already opened on the pool.
+        self.ensure_registered().await?;
+        self.fetch_pool_round().await?;
+        let round_id = self.pool_round;
+        self.ensure_round_stats(round_id).await?;
+
+        // Per-template dedup objects — one per *distinct* template the
+        // batch references. Unlike V1's override-to-buyer's-template
+        // approach, V2 honors the share's actual template id: any
+        // template owned by the buyer drains the order, and shares
+        // hashed against different buyer templates retain their own
+        // dedup envelopes (so re-publishing a template doesn't drag
+        // stale dedup state with it).
+        let mut unique_templates: Vec<String> =
+            batch.iter().map(|(t, _)| t.clone()).collect();
+        unique_templates.sort();
+        unique_templates.dedup();
+        for tid in &unique_templates {
+            self.ensure_share_dedup(tid).await?;
+        }
+
+        let order_id = self
+            .hashpower_buy
+            .as_ref()
+            .map(|c| c.order_id)
+            .ok_or_else(|| anyhow!("hashpower_buy not configured"))?;
+
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let clock_arg = self.clock_arg(&mut ptb).await?;
+
+        // MinerStats (owned mutable)
+        let miner_stats_id = self
+            .miner_stats_id
+            .ok_or_else(|| anyhow!("miner_stats not set"))?;
+        let (ms_ver, ms_dig) = self.get_ver(miner_stats_id).await?;
+        let ms_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((
+                miner_stats_id,
+                ms_ver,
+                ms_dig,
+            )))
+            .map_err(|e| anyhow!("miner_stats arg: {}", e))?;
+
+        // MinerRoundStats (owned mutable)
+        let mrs_id = self
+            .miner_round_stats_id
+            .ok_or_else(|| anyhow!("miner_round_stats not set"))?;
+        let (mrs_ver, mrs_dig) = self.get_ver(mrs_id).await?;
+        let mrs_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((mrs_id, mrs_ver, mrs_dig)))
+            .map_err(|e| anyhow!("miner_round_stats arg: {}", e))?;
+
+        // Per-template args: Template (frozen → ImmOrOwnedObject) +
+        // ShareDedup (owned, mutable).
+        let mut tpl_args: HashMap<String, sui_sdk::types::transaction::Argument> =
+            HashMap::new();
+        let mut dedup_args: HashMap<String, sui_sdk::types::transaction::Argument> =
+            HashMap::new();
+        for tid in &unique_templates {
+            let tpl_obj_id = ObjectID::from_str(tid)
+                .map_err(|_| anyhow!("Invalid template ID: {}", tid))?;
+            let (tpl_ver, tpl_dig) = self.get_ver(tpl_obj_id).await?;
+            let tpl_arg = ptb
+                .obj(ObjectArg::ImmOrOwnedObject((tpl_obj_id, tpl_ver, tpl_dig)))
+                .map_err(|e| anyhow!("template arg: {}", e))?;
+            tpl_args.insert(tid.clone(), tpl_arg);
+
+            let dedup_id = *self
+                .share_dedup_ids
+                .get(tid)
+                .ok_or_else(|| anyhow!("share_dedup not set for template {}", tid))?;
+            let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+            let d_arg = ptb
+                .obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+                .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
+            dedup_args.insert(tid.clone(), d_arg);
+        }
+
+        // BuyerHashpowerOrder<QuoteT> (shared mutable). Take it ONCE
+        // per batch — multiple submit_share_for_buyer_pay calls in the
+        // same PTB mutate the same Argument.
+        let order_iver = self.get_initial_shared_ver(order_id).await?;
+        let order_arg = ptb
+            .obj(ObjectArg::SharedObject {
+                id: order_id,
+                initial_shared_version: order_iver,
+                mutability: SharedObjectMutability::Mutable,
+            })
+            .map_err(|e| anyhow!("buyer order arg: {}", e))?;
+
+        // Pre-bake the miner's recipient address.
+        let recipient_arg = ptb
+            .pure(self.address)
+            .map_err(|e| anyhow!("recipient arg: {}", e))?;
+        let quote_type = self.quote_type.clone();
+
+        for (template_id, share) in batch {
+            let tpl_arg = *tpl_args.get(template_id).unwrap();
+            let dedup_arg = *dedup_args.get(template_id).unwrap();
+            let en1_arg = ptb
+                .pure(share.extranonce1.clone())
+                .map_err(|e| anyhow!("en1 arg: {}", e))?;
+            let en2_arg = ptb
+                .pure(share.extranonce2.clone())
+                .map_err(|e| anyhow!("en2 arg: {}", e))?;
+            let ntime_arg = ptb.pure(share.ntime).map_err(|e| anyhow!("ntime arg: {}", e))?;
+            let nonce_arg = ptb.pure(share.nonce).map_err(|e| anyhow!("nonce arg: {}", e))?;
+            let ver_arg = ptb.pure(share.version).map_err(|e| anyhow!("ver arg: {}", e))?;
+
+            // submit_share_for_buyer_pay<QuoteT>(template, order, ms, mrs,
+            //   dedup, en1, en2, ntime, nonce, version, clock) -> Coin<QuoteT>
+            //
+            // On-chain assertion: template.owner == order.buyer. Sidecar
+            // pre-flight check is unnecessary — the PTB will simply abort
+            // if the operator's stratum is feeding us non-buyer-owned
+            // templates.
+            let coin_out = ptb.programmable_move_call(
+                self.package_id,
+                ident("pool"),
+                ident("submit_share_for_buyer_pay"),
+                vec![quote_type.clone()],
+                vec![
+                    tpl_arg, order_arg, ms_arg, mrs_arg, dedup_arg, en1_arg, en2_arg,
+                    ntime_arg, nonce_arg, ver_arg, clock_arg,
+                ],
+            );
+
+            // Route the Coin<QuoteT> to the miner's wallet within the PTB.
+            ptb.command(sui_sdk::types::transaction::Command::TransferObjects(
+                vec![coin_out],
+                recipient_arg,
+            ));
+        }
+
+        // ── Diagnostic pre-flight log ─────────────────────────────────
+        //
+        // Logs every input that participates in the on-chain check so a
+        // failed batch can be triaged from a single log line. Specifically
+        // this lets us see whether the share's `template_id` was a
+        // buyer-owned template (the V2 lane requires `template.owner ==
+        // order.buyer` per Move assertion).
+        let template_ids_csv = unique_templates.join(",");
+        info!(
+            "buyer-pay PTB pre-submit — order={} sender={} quote={} templates_in_batch=[{}] shares={}",
+            order_id,
+            self.address,
+            quote_type,
+            template_ids_csv,
+            batch.len()
+        );
+
+        let resp = self.exec(ptb.finish()).await?;
+
+        // ── Post-execute status check ─────────────────────────────────
+        //
+        // `self.exec` returns the response even when the Move call aborts
+        // (Sui treats an abort as a "successful tx with Failure status").
+        // Without this check the caller would silently drop the abort
+        // reason and just see a digest. Surface it as an Err so the
+        // sidecar's `flush()` logs the real reason instead of an opaque
+        // success digest.
+        if let Some(eff) = &resp.effects {
+            use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
+            if let SuiExecutionStatus::Failure { error } = eff.status() {
+                return Err(anyhow!(
+                    "submit_share_for_buyer_pay aborted on chain: {} (digest: {})",
+                    error,
+                    resp.digest
+                ));
+            }
+        }
+
+        self.update_from_resp(&resp);
+        Ok(resp.digest.to_string())
+    }
+
     // ── Auto-sell (post-batch) ────────────────────────────────────────────────
 
     /// Place a single `hash_share_market::place_sell_order` for the miner's
@@ -543,7 +967,7 @@ impl MinerClient {
             self.package_id,
             ident("hash_share_market"),
             ident("place_sell_order"),
-            vec![hs_cfg.hashshare_type.clone()],
+            vec![hs_cfg.hashshare_type.clone(), self.quote_type.clone()],
             vec![price_arg, expires_arg, first_arg],
         );
 
@@ -553,6 +977,640 @@ impl MinerClient {
             "{} ({} units @ {} MIST/unit)",
             resp.digest, total_units, cfg.price_per_unit_mist
         )))
+    }
+
+    // ── Auto-fill-best-bid ───────────────────────────────────────────────────
+    //
+    // Scan the orderbook for resting BuyOrder<HS_NNN> objects, pick the
+    // highest-priced one above the floor, and fill it via
+    // `hash_share_market::fill_buy_order`. The PTB:
+    //   1. Merges all owned HashShare coins into the first.
+    //   2. Splits off exactly `min(my_units, order.budget / order.price)`.
+    //   3. Calls fill_buy_order(order, fee_pool, coin_to_sell, ctx).
+    //
+    // The seller receives SUI immediately (no resting order created). Any
+    // leftover HashShare inventory stays in the wallet for the next batch
+    // — the sidecar's fall-through logic will try auto_sell on it.
+
+    /// Returns `None` when auto-fill is disabled, the wallet holds no
+    /// HashShares, or no resting bid meets the floor. Returns
+    /// `Some((digest, summary))` on a successful fill.
+    pub async fn auto_fill_best_bid(&mut self) -> Result<Option<String>> {
+        let cfg = match self.auto_fill_bid.clone() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let hs_cfg = match self.hashshare.clone() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let fee_pool_id = match self.market_fee_pool_id {
+            Some(id) => id,
+            None => {
+                warn!("auto_fill_best_bid: MarketFeePool not configured (use --market-fee-pool); skipping");
+                return Ok(None);
+            }
+        };
+
+        // 1. Inventory check.
+        let hs_type = hs_cfg.hashshare_type.to_string();
+        let coins_page = self
+            .client
+            .coin_read_api()
+            .get_coins(self.address, Some(hs_type.clone()), None, Some(50))
+            .await
+            .map_err(|e| anyhow!("get_coins(HashShare): {}", e))?;
+        if coins_page.data.is_empty() {
+            return Ok(None);
+        }
+        let my_total_units: u64 = coins_page.data.iter().map(|c| c.balance).sum();
+        if my_total_units == 0 {
+            return Ok(None);
+        }
+
+        // 2. Discover BuyOrder<HS_NNN> candidates via event scan, then
+        //    fetch each object to read current price + budget. Only orders
+        //    of the active HS slot's coin type count.
+        let want_buyorder_type = format!(
+            "{}::hash_share_market::BuyOrder<{}, {}>",
+            self.package_id, hs_type, self.quote_type
+        );
+        let candidates = self
+            .find_buy_orders(&want_buyorder_type, &cfg)
+            .await?;
+        let (order_id, order_iver, price_per_unit, max_units_order_can_fill) =
+            match candidates {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+        let sell_units = my_total_units.min(max_units_order_can_fill);
+        if sell_units == 0 {
+            return Ok(None);
+        }
+
+        // 3. PTB: merge owned coins, split exact amount, fill_buy_order.
+        let mut ptb = ProgrammableTransactionBuilder::new();
+
+        let mut owned_refs: Vec<(ObjectID, SequenceNumber, ObjectDigest)> = coins_page
+            .data
+            .iter()
+            .map(|c| (c.coin_object_id, c.version, c.digest))
+            .collect();
+        let (first_id, first_ver, first_dig) = owned_refs.remove(0);
+        let first_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((first_id, first_ver, first_dig)))
+            .map_err(|e| anyhow!("first hs coin arg: {}", e))?;
+        if !owned_refs.is_empty() {
+            let mut tail_args = Vec::with_capacity(owned_refs.len());
+            for (oid, ver, dig) in &owned_refs {
+                tail_args.push(
+                    ptb.obj(ObjectArg::ImmOrOwnedObject((*oid, *ver, *dig)))
+                        .map_err(|e| anyhow!("tail hs coin arg: {}", e))?,
+                );
+            }
+            ptb.command(sui_sdk::types::transaction::Command::MergeCoins(
+                first_arg, tail_args,
+            ));
+        }
+
+        // Split off sell_units into a new coin.
+        let amount_arg = ptb
+            .pure(sell_units)
+            .map_err(|e| anyhow!("sell_units arg: {}", e))?;
+        let split = ptb.command(sui_sdk::types::transaction::Command::SplitCoins(
+            first_arg,
+            vec![amount_arg],
+        ));
+        // `SplitCoins` returns NestedResult; we want index 0.
+        let coin_to_sell = sui_sdk::types::transaction::Argument::NestedResult(
+            match split {
+                sui_sdk::types::transaction::Argument::Result(idx) => idx,
+                _ => return Err(anyhow!("SplitCoins did not return Result")),
+            },
+            0,
+        );
+
+        // Order: shared mutable.
+        let order_arg = ptb
+            .obj(ObjectArg::SharedObject {
+                id: order_id,
+                initial_shared_version: order_iver,
+                mutability: SharedObjectMutability::Mutable,
+            })
+            .map_err(|e| anyhow!("order arg: {}", e))?;
+        let fee_pool_iver = self.get_initial_shared_ver(fee_pool_id).await?;
+        let fee_pool_arg = ptb
+            .obj(ObjectArg::SharedObject {
+                id: fee_pool_id,
+                initial_shared_version: fee_pool_iver,
+                mutability: SharedObjectMutability::Immutable,
+            })
+            .map_err(|e| anyhow!("fee_pool arg: {}", e))?;
+
+        ptb.programmable_move_call(
+            self.package_id,
+            ident("hash_share_market"),
+            ident("fill_buy_order"),
+            vec![hs_cfg.hashshare_type.clone(), self.quote_type.clone()],
+            vec![order_arg, fee_pool_arg, coin_to_sell],
+        );
+
+        let resp = self.exec(ptb.finish()).await?;
+        self.update_from_resp(&resp);
+        Ok(Some(format!(
+            "{} (filled {} units @ {} MIST/unit on order {})",
+            resp.digest, sell_units, price_per_unit, order_id
+        )))
+    }
+
+    /// Returns `Some((order_id, initial_shared_version, price, max_units))`
+    /// for the highest-priced BuyOrder matching the active HS type whose
+    /// price meets the floor; `None` if no candidate.
+    async fn find_buy_orders(
+        &self,
+        want_type: &str,
+        cfg: &AutoFillBidConfig,
+    ) -> Result<Option<(ObjectID, SequenceNumber, u64, u64)>> {
+        // Walk last 100 BuyOrderPlaced events.
+        let event_type = format!(
+            "{}::hash_share_market::BuyOrderPlaced",
+            self.package_id
+        );
+        let filter = EventFilter::MoveEventType(
+            event_type
+                .parse()
+                .map_err(|e| anyhow!("parse event type: {}", e))?,
+        );
+        let page = self
+            .client
+            .event_api()
+            .query_events(filter, None, Some(100), true)
+            .await
+            .map_err(|e| anyhow!("query_events: {}", e))?;
+
+        let mut best: Option<(ObjectID, SequenceNumber, u64, u64)> = None;
+        for ev in page.data {
+            let order_id_hex = match ev.parsed_json["order_id"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let normalized = if order_id_hex.starts_with("0x") {
+                order_id_hex.to_string()
+            } else {
+                format!("0x{}", order_id_hex)
+            };
+            let order_id = match ObjectID::from_str(&normalized) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            // Fetch object — need type + content.
+            let opts = SuiObjectDataOptions::new()
+                .with_type()
+                .with_content()
+                .with_owner();
+            let resp = match self
+                .client
+                .read_api()
+                .get_object_with_options(order_id, opts)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let data = match resp.data {
+                Some(d) => d,
+                None => continue, // deleted / cancelled
+            };
+            // Type-match the BuyOrder<HS_NNN> generic instance.
+            if data
+                .type_
+                .as_ref()
+                .map(|t| t.to_string() != want_type)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            // Extract price + remaining budget from move object fields.
+            let (price, budget) = match read_buy_order_fields(&data) {
+                Some(v) => v,
+                None => continue,
+            };
+            if price < cfg.floor_price_mist || budget == 0 {
+                continue;
+            }
+            let max_units = budget / price;
+            if max_units == 0 {
+                continue;
+            }
+            // Read the shared-object initial_shared_version from Owner.
+            let iver = match data.owner {
+                Some(Owner::Shared { initial_shared_version, .. }) => initial_shared_version,
+                _ => continue,
+            };
+            let candidate = (order_id, iver, price, max_units);
+            best = Some(match best {
+                None => candidate,
+                Some(b) if price > b.2 => candidate,
+                Some(b) => b,
+            });
+        }
+        Ok(best)
+    }
+
+    // ── Auto-sell peg-to-market ──────────────────────────────────────────────
+    //
+    // Compute a target price relative to the live orderbook each batch, then
+    // either top up the miner's existing SellOrder + retarget its price, or
+    // place a fresh one. The active order is discovered by scanning
+    // SellOrderPlaced events filtered by `seller == self.address`.
+
+    /// Returns `None` when the peg config is missing, when the wallet holds
+    /// no HashShares, or when the orderbook gives us no anchor and there's
+    /// no fallback floor. Returns `Some((digest, summary))` on success.
+    pub async fn auto_sell_pegged(&mut self) -> Result<Option<String>> {
+        let cfg = match self.auto_sell_peg.clone() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let hs_cfg = match self.hashshare.clone() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // 1. Inventory.
+        let hs_type = hs_cfg.hashshare_type.to_string();
+        let coins_page = self
+            .client
+            .coin_read_api()
+            .get_coins(self.address, Some(hs_type.clone()), None, Some(50))
+            .await
+            .map_err(|e| anyhow!("get_coins(HashShare): {}", e))?;
+        if coins_page.data.is_empty() {
+            return Ok(None);
+        }
+        let new_units: u64 = coins_page.data.iter().map(|c| c.balance).sum();
+        if new_units == 0 {
+            return Ok(None);
+        }
+
+        // 2. Compute target price from orderbook.
+        let want_buy = format!(
+            "{}::hash_share_market::BuyOrder<{}, {}>",
+            self.package_id, hs_type, self.quote_type
+        );
+        let want_sell = format!(
+            "{}::hash_share_market::SellOrder<{}, {}>",
+            self.package_id, hs_type, self.quote_type
+        );
+        let (best_bid, best_ask) = self
+            .scan_orderbook_top(&want_buy, &want_sell)
+            .await?;
+        let anchor_price = match (cfg.anchor, best_bid, best_ask) {
+            (PegAnchor::BestBid, Some(b), _) => b,
+            (PegAnchor::BestAsk, _, Some(a)) => a.saturating_sub(1),
+            (PegAnchor::Mid, Some(b), Some(a)) => (b + a) / 2,
+            (PegAnchor::Mid, Some(b), None) => b,
+            (PegAnchor::Mid, None, Some(a)) => a.saturating_sub(1),
+            (_, _, _) => 0,
+        };
+        let target = apply_bps(anchor_price, cfg.offset_bps);
+        // Floor selection priority on an empty orderbook:
+        //   1. the dynamic atomic (off-chain feeder, live BTC + difficulty)
+        //   2. the static fallback in the env-driven config
+        //   3. skip the batch if neither is set
+        let dynamic_floor = self
+            .dynamic_floor_mist
+            .as_ref()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        let target = if target > 0 {
+            target
+        } else if dynamic_floor > 0 {
+            dynamic_floor
+        } else if cfg.fallback_floor_mist > 0 {
+            cfg.fallback_floor_mist
+        } else {
+            warn!("auto_sell_pegged: empty orderbook + no fallback_floor; skipping");
+            return Ok(None);
+        };
+
+        // 3. Find an existing live SellOrder owned by this miner.
+        let existing = self
+            .find_my_active_sell_order(&want_sell)
+            .await?;
+
+        // 4. Build PTB.
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let mut owned_refs: Vec<(ObjectID, SequenceNumber, ObjectDigest)> = coins_page
+            .data
+            .iter()
+            .map(|c| (c.coin_object_id, c.version, c.digest))
+            .collect();
+        let (first_id, first_ver, first_dig) = owned_refs.remove(0);
+        let first_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((first_id, first_ver, first_dig)))
+            .map_err(|e| anyhow!("first hs coin arg: {}", e))?;
+        if !owned_refs.is_empty() {
+            let mut tail_args = Vec::with_capacity(owned_refs.len());
+            for (oid, ver, dig) in &owned_refs {
+                tail_args.push(
+                    ptb.obj(ObjectArg::ImmOrOwnedObject((*oid, *ver, *dig)))
+                        .map_err(|e| anyhow!("tail hs coin arg: {}", e))?,
+                );
+            }
+            ptb.command(sui_sdk::types::transaction::Command::MergeCoins(
+                first_arg, tail_args,
+            ));
+        }
+
+        if let Some((order_id, order_iver, current_price)) = existing {
+            // Top up the existing order with this batch's coins; then
+            // retarget price if it drifted by more than 1 MIST/unit.
+            let order_arg = ptb
+                .obj(ObjectArg::SharedObject {
+                    id: order_id,
+                    initial_shared_version: order_iver,
+                    mutability: SharedObjectMutability::Mutable,
+                })
+                .map_err(|e| anyhow!("order arg: {}", e))?;
+            ptb.programmable_move_call(
+                self.package_id,
+                ident("hash_share_market"),
+                ident("top_up_sell_order"),
+                vec![hs_cfg.hashshare_type.clone(), self.quote_type.clone()],
+                vec![order_arg, first_arg],
+            );
+            if current_price != target {
+                let price_arg = ptb
+                    .pure(target)
+                    .map_err(|e| anyhow!("price arg: {}", e))?;
+                ptb.programmable_move_call(
+                    self.package_id,
+                    ident("hash_share_market"),
+                    ident("update_sell_order_price"),
+                    vec![hs_cfg.hashshare_type.clone(), self.quote_type.clone()],
+                    vec![order_arg, price_arg],
+                );
+            }
+            let resp = self.exec(ptb.finish()).await?;
+            self.update_from_resp(&resp);
+            return Ok(Some(format!(
+                "{} (peg {:?}±{}bps → {} MIST/unit · topped order {} with {} units)",
+                resp.digest, cfg.anchor, cfg.offset_bps, target, order_id, new_units
+            )));
+        }
+
+        // No existing order — place fresh.
+        let price_arg = ptb
+            .pure(target)
+            .map_err(|e| anyhow!("price arg: {}", e))?;
+        let expires_arg = ptb
+            .pure(cfg.expires_at_ms)
+            .map_err(|e| anyhow!("expires arg: {}", e))?;
+        ptb.programmable_move_call(
+            self.package_id,
+            ident("hash_share_market"),
+            ident("place_sell_order"),
+            vec![hs_cfg.hashshare_type.clone(), self.quote_type.clone()],
+            vec![price_arg, expires_arg, first_arg],
+        );
+        let resp = self.exec(ptb.finish()).await?;
+        self.update_from_resp(&resp);
+        Ok(Some(format!(
+            "{} (peg {:?}±{}bps → placed {} units @ {} MIST/unit)",
+            resp.digest, cfg.anchor, cfg.offset_bps, new_units, target
+        )))
+    }
+
+    /// Walk the last 100 BuyOrderPlaced + SellOrderPlaced events for
+    /// matching coin types and return (best_bid_price, best_ask_price).
+    /// Returns None for either side when no live orders are observed.
+    async fn scan_orderbook_top(
+        &self,
+        want_buy_type: &str,
+        want_sell_type: &str,
+    ) -> Result<(Option<u64>, Option<u64>)> {
+        let mut best_bid: Option<u64> = None;
+        let mut best_ask: Option<u64> = None;
+
+        let bid_evt = format!(
+            "{}::hash_share_market::BuyOrderPlaced",
+            self.package_id
+        );
+        let bid_page = self
+            .client
+            .event_api()
+            .query_events(
+                EventFilter::MoveEventType(bid_evt.parse().map_err(|e| anyhow!("{}", e))?),
+                None,
+                Some(100),
+                true,
+            )
+            .await
+            .map_err(|e| anyhow!("query_events: {}", e))?;
+        for ev in bid_page.data {
+            let order_id_hex = match ev.parsed_json["order_id"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let norm = if order_id_hex.starts_with("0x") {
+                order_id_hex.to_string()
+            } else {
+                format!("0x{}", order_id_hex)
+            };
+            let oid = match ObjectID::from_str(&norm) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let resp = match self
+                .client
+                .read_api()
+                .get_object_with_options(
+                    oid,
+                    SuiObjectDataOptions::new().with_type().with_content(),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let data = match resp.data {
+                Some(d) => d,
+                None => continue,
+            };
+            if data
+                .type_
+                .as_ref()
+                .map(|t| t.to_string() != want_buy_type)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if let Some((price, budget)) = read_buy_order_fields(&data) {
+                if budget > 0 {
+                    best_bid = Some(match best_bid {
+                        None => price,
+                        Some(b) if price > b => price,
+                        Some(b) => b,
+                    });
+                }
+            }
+        }
+
+        let ask_evt = format!(
+            "{}::hash_share_market::SellOrderPlaced",
+            self.package_id
+        );
+        let ask_page = self
+            .client
+            .event_api()
+            .query_events(
+                EventFilter::MoveEventType(ask_evt.parse().map_err(|e| anyhow!("{}", e))?),
+                None,
+                Some(100),
+                true,
+            )
+            .await
+            .map_err(|e| anyhow!("query_events: {}", e))?;
+        for ev in ask_page.data {
+            let order_id_hex = match ev.parsed_json["order_id"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let norm = if order_id_hex.starts_with("0x") {
+                order_id_hex.to_string()
+            } else {
+                format!("0x{}", order_id_hex)
+            };
+            let oid = match ObjectID::from_str(&norm) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let resp = match self
+                .client
+                .read_api()
+                .get_object_with_options(
+                    oid,
+                    SuiObjectDataOptions::new().with_type().with_content(),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let data = match resp.data {
+                Some(d) => d,
+                None => continue,
+            };
+            if data
+                .type_
+                .as_ref()
+                .map(|t| t.to_string() != want_sell_type)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if let Some((price, inventory)) = read_sell_order_fields(&data) {
+                if inventory > 0 {
+                    best_ask = Some(match best_ask {
+                        None => price,
+                        Some(b) if price < b => price,
+                        Some(b) => b,
+                    });
+                }
+            }
+        }
+
+        Ok((best_bid, best_ask))
+    }
+
+    /// Find the most recent live SellOrder owned by this miner for the
+    /// active HS slot. Returns (order_id, initial_shared_version, current_price).
+    async fn find_my_active_sell_order(
+        &self,
+        want_sell_type: &str,
+    ) -> Result<Option<(ObjectID, SequenceNumber, u64)>> {
+        let evt = format!(
+            "{}::hash_share_market::SellOrderPlaced",
+            self.package_id
+        );
+        let page = self
+            .client
+            .event_api()
+            .query_events(
+                EventFilter::MoveEventType(evt.parse().map_err(|e| anyhow!("{}", e))?),
+                None,
+                Some(100),
+                true,
+            )
+            .await
+            .map_err(|e| anyhow!("query_events: {}", e))?;
+        for ev in page.data {
+            let seller_hex = ev.parsed_json["seller"].as_str().unwrap_or("");
+            let seller_norm = if seller_hex.starts_with("0x") {
+                seller_hex.to_string()
+            } else {
+                format!("0x{}", seller_hex)
+            };
+            if SuiAddress::from_str(&seller_norm)
+                .map(|a| a != self.address)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let order_id_hex = match ev.parsed_json["order_id"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let norm = if order_id_hex.starts_with("0x") {
+                order_id_hex.to_string()
+            } else {
+                format!("0x{}", order_id_hex)
+            };
+            let oid = match ObjectID::from_str(&norm) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let opts = SuiObjectDataOptions::new()
+                .with_type()
+                .with_content()
+                .with_owner();
+            let resp = match self
+                .client
+                .read_api()
+                .get_object_with_options(oid, opts)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let data = match resp.data {
+                Some(d) => d,
+                None => continue, // deleted / cancelled
+            };
+            if data
+                .type_
+                .as_ref()
+                .map(|t| t.to_string() != want_sell_type)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let iver = match data.owner {
+                Some(Owner::Shared { initial_shared_version, .. }) => initial_shared_version,
+                _ => continue,
+            };
+            let (price, inventory) = match read_sell_order_fields(&data) {
+                Some(v) => v,
+                None => continue,
+            };
+            if inventory == 0 {
+                continue; // empty resting order — skip
+            }
+            return Ok(Some((oid, iver, price)));
+        }
+        Ok(None)
     }
 
     // ── Round accumulation ────────────────────────────────────────────────────
@@ -1089,6 +2147,41 @@ pub fn load_keystore(path: &str) -> Result<SuiKeyPair> {
     SuiKeyPair::decode_base64(&key).map_err(|e| anyhow!("Invalid keypair: {}", e))
 }
 
+/// Load a specific keypair from the keystore by Sui address. Unlike
+/// `load_keystore`, this ignores `client.yaml`'s active_address and
+/// matches the supplied address directly. Used by stratum-server +
+/// miner-sidecar to lock the signer to whatever the operator's env file
+/// specifies, independent of the global CLI state.
+pub fn load_keystore_by_address(path: &str, address: &str) -> Result<SuiKeyPair> {
+    let expanded = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| anyhow!("HOME not set"))?;
+        format!("{}{}", home, &path[1..])
+    } else {
+        path.to_string()
+    };
+    let content = std::fs::read_to_string(&expanded)
+        .map_err(|e| anyhow!("Cannot read keystore {}: {}", expanded, e))?;
+    let keys: Vec<String> = serde_json::from_str(content.trim())
+        .map_err(|e| anyhow!("Cannot parse keystore JSON: {}", e))?;
+
+    let target = address.to_lowercase();
+    for key_b64 in &keys {
+        if let Ok(kp) = SuiKeyPair::decode_base64(key_b64) {
+            let addr = SuiAddress::from(&kp.public()).to_string().to_lowercase();
+            if addr == target {
+                return Ok(kp);
+            }
+        }
+    }
+    Err(anyhow!(
+        "Address {} not found in keystore at {}",
+        address,
+        expanded,
+    ))
+}
+
 /// Build, sign, and execute a PTB.  Used by both `MinerClient` and the
 /// operator-level `SuiSubmitter`.
 ///
@@ -1155,7 +2248,16 @@ pub async fn execute_ptb(
             SuiTransactionBlockResponseOptions::new()
                 .with_effects()
                 .with_object_changes(),
-            Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            // `WaitForEffectsCert` is the faster path — we get the
+            // effects (including any Move abort reason) once validators
+            // have certified them, without waiting on the local
+            // fullnode to apply the state change. Empirically a Sui
+            // mainnet fullnode under load can take 60+ seconds to
+            // apply, manifesting as a "Request timeout" SDK error that
+            // masks the actual abort. The local-execution wait was
+            // useful when the next PTB needed to read the post-state
+            // immediately, but the share-submission hot path doesn't.
+            Some(ExecuteTransactionRequestType::WaitForEffectsCert),
         )
         .await
         .map_err(|e| anyhow!("execute_transaction_block: {}", e));
@@ -1213,7 +2315,16 @@ pub async fn execute_ptb_with_events(
                 .with_effects()
                 .with_events()
                 .with_object_changes(),
-            Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            // `WaitForEffectsCert` is the faster path — we get the
+            // effects (including any Move abort reason) once validators
+            // have certified them, without waiting on the local
+            // fullnode to apply the state change. Empirically a Sui
+            // mainnet fullnode under load can take 60+ seconds to
+            // apply, manifesting as a "Request timeout" SDK error that
+            // masks the actual abort. The local-execution wait was
+            // useful when the next PTB needed to read the post-state
+            // immediately, but the share-submission hot path doesn't.
+            Some(ExecuteTransactionRequestType::WaitForEffectsCert),
         )
         .await
         .map_err(|e| anyhow!("execute_transaction_block: {}", e))
@@ -1224,4 +2335,78 @@ pub async fn execute_ptb_with_events(
 /// Infallible `Identifier` from a static string literal.
 fn ident(s: &str) -> Identifier {
     Identifier::from_str(s).expect("valid identifier")
+}
+
+/// Extract `(price_per_unit_mist, remaining_budget_mist)` from a
+/// `BuyOrder<T>`'s Move-object content. The Move struct lays out:
+///   - price_per_unit_mist: u64
+///   - payment: Balance<SUI>     // serialized as flat decimal string
+fn read_buy_order_fields(
+    data: &sui_sdk::rpc_types::SuiObjectData,
+) -> Option<(u64, u64)> {
+    let content = data.content.as_ref()?;
+    let move_obj = match content {
+        sui_sdk::rpc_types::SuiParsedData::MoveObject(o) => o,
+        _ => return None,
+    };
+    let fields = match &move_obj.fields {
+        sui_sdk::rpc_types::SuiMoveStruct::WithFields(m) => m,
+        sui_sdk::rpc_types::SuiMoveStruct::WithTypes { fields, .. } => fields,
+        _ => return None,
+    };
+    let price = parse_u64_field(fields.get("price_per_unit_mist")?)?;
+    let budget = parse_u64_field(fields.get("payment")?)?;
+    Some((price, budget))
+}
+
+/// Mirror of `read_buy_order_fields` for `SellOrder<T>`:
+///   - price_per_unit_mist: u64
+///   - inventory: Balance<T>
+fn read_sell_order_fields(
+    data: &sui_sdk::rpc_types::SuiObjectData,
+) -> Option<(u64, u64)> {
+    let content = data.content.as_ref()?;
+    let move_obj = match content {
+        sui_sdk::rpc_types::SuiParsedData::MoveObject(o) => o,
+        _ => return None,
+    };
+    let fields = match &move_obj.fields {
+        sui_sdk::rpc_types::SuiMoveStruct::WithFields(m) => m,
+        sui_sdk::rpc_types::SuiMoveStruct::WithTypes { fields, .. } => fields,
+        _ => return None,
+    };
+    let price = parse_u64_field(fields.get("price_per_unit_mist")?)?;
+    let inventory = parse_u64_field(fields.get("inventory")?)?;
+    Some((price, inventory))
+}
+
+/// `Balance<T>` serializes as a flat decimal string in the RPC content
+/// JSON; `u64` fields serialize either as JSON numbers or numeric strings.
+/// Accept both forms.
+fn parse_u64_field(v: &sui_sdk::rpc_types::SuiMoveValue) -> Option<u64> {
+    use sui_sdk::rpc_types::SuiMoveValue;
+    match v {
+        SuiMoveValue::Number(n) => Some(*n as u64),
+        SuiMoveValue::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// `apply_bps(p, bps)` = `p * (10000 + bps) / 10000`. Saturating.
+/// Caller passes a *signed* offset (+100 = +1%, -50 = -0.5%).
+fn apply_bps(anchor: u64, bps: i32) -> u64 {
+    if anchor == 0 {
+        return 0;
+    }
+    let num = 10_000i64 + bps as i64;
+    if num <= 0 {
+        return 0;
+    }
+    let n = num as u128;
+    let scaled = (anchor as u128).saturating_mul(n) / 10_000u128;
+    if scaled > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        scaled as u64
+    }
 }

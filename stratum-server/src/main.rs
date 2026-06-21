@@ -4,10 +4,30 @@
 //! - Accepts miner connections
 //! - Gets block templates from Bitcoin Core
 //! - Validates shares locally
-//! - Submits valid shares to the Sui pool contract
+//! - Registers each fresh template as a Sui object
 //!
-//! Usage:
-//!   stratum-server --bitcoin-rpc http://user:pass@127.0.0.1:8332 --port 3333
+//! ## Operator vs buyer mode (one binary, two roles)
+//!
+//! Template registration dispatches off `--pool-admin-cap` (env var
+//! `POOL_ADMIN_CAP`):
+//!
+//! - **Operator mode** (cap set): calls `pool::register_template`. The
+//!   server's signer must own the cap; resulting `Template.owner =
+//!   SUI_ADDRESS` (the operator wallet).
+//! - **Buyer mode** (cap empty): calls `pool::register_template_public`,
+//!   splitting the per-template `PERMISSIONLESS_TEMPLATE_FEE_MIST`
+//!   (0.01 SUI) off the gas coin. Resulting `Template.owner =
+//!   SUI_ADDRESS` (the buyer wallet). Pair with `miner-sidecar
+//!   --hashpower-buy-order-id` to drain a `BuyerHashpowerOrder<QuoteT>`
+//!   on every share — see `pool.move`'s buyer-template lane section.
+//!
+//! Either mode auto-rotates templates as bitcoind sees new tips. The
+//! `--override-template-id` flag pins a single Template as the only
+//! job (no rotation) — useful for tests and known-job replays.
+//!
+//! Usage (operator):
+//!   stratum-server --bitcoin-rpc http://user:pass@127.0.0.1:8332 \
+//!     --pool-admin-cap 0x... --sui-address <OPERATOR> --port 3333
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -146,6 +166,19 @@ struct Args {
     /// HTTP port for /health and /metrics endpoints (0 = disabled)
     #[arg(long, default_value = "9091")]
     metrics_port: u16,
+
+    /// Buyer-template lane: pin a specific on-chain Template as the
+    /// always-active mining job. The stratum-server fetches its fields
+    /// once at startup, builds a MiningJob from them, and serves THAT
+    /// job to every connecting miner — no bitcoind polling, no
+    /// auto-rotation, no operator template registration.
+    ///
+    /// The Avalon mines this template's bytes; the sidecar (in buyer
+    /// mode) submits the resulting shares against the matching
+    /// HashpowerBuyOrder via `pool::submit_share_for_pay`. Restart with
+    /// a fresh Template id when the buyer publishes a newer one.
+    #[arg(long, default_value = "")]
+    override_template_id: String,
 }
 
 /// Combined share tracking: timestamps + last share time (Phase 1B)
@@ -504,8 +537,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Start job updater task (solo mode uses Bitcoin RPC, pooled mode uses on-chain templates)
-    if state.bitcoin.is_some() {
+    // Start job updater task.
+    //  • Buyer-template lane (--override-template-id): one-shot job from
+    //    an on-chain buyer Template. No polling, no rotation.
+    //  • Solo mode (--bitcoin-rpc + no override): job_updater polls bitcoind.
+    //  • Decentralized mode: pooled_job_updater scans on-chain templates.
+    if !args.override_template_id.is_empty() {
+        let state_clone = state.clone();
+        let tid = args.override_template_id.clone();
+        let rpc = args.sui_rpc_url.clone();
+        let pkg = args.sui_package.clone();
+        tokio::spawn(async move {
+            override_job_updater(state_clone, tid, rpc, pkg).await;
+        });
+    } else if state.bitcoin.is_some() {
         let state_clone = state.clone();
         tokio::spawn(async move {
             job_updater(state_clone).await;
@@ -823,6 +868,96 @@ async fn job_updater(state: Arc<ServerState>) {
                 notify_all_miners(&state, &job).await;
             }
             Err(e) => warn!("Failed to create job: {}", e),
+        }
+    }
+}
+
+/// Buyer-template lane: pin a single on-chain Template as the active
+/// job. No bitcoind, no rotation. Lifecycle:
+///   1. Fetch the Template's fields from Sui via sui_queries::fetch_template.
+///   2. Build a MiningJob, push into state.current_job.
+///   3. Broadcast to all currently-connected miners via notify_all_miners.
+///   4. Sit. Never refresh.
+/// Operator restarts the stratum with a new --override-template-id when
+/// the buyer publishes an updated Template.
+async fn override_job_updater(
+    state: Arc<ServerState>,
+    template_id: String,
+    rpc_url: String,
+    package_id: String,
+) {
+    info!(
+        "override_job_updater: pinning buyer Template {} as the sole job source",
+        template_id
+    );
+    let querier = match sui_queries::SuiTemplateQuerier::new_async(rpc_url, package_id).await {
+        Ok(q) => q,
+        Err(e) => {
+            error!("override_job_updater: SuiClient init failed: {}", e);
+            return;
+        }
+    };
+    let template_data = match querier.fetch_template(&template_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                "override_job_updater: cannot fetch Template {}: {}",
+                template_id, e
+            );
+            return;
+        }
+    };
+    info!(
+        "override_job_updater: fetched template height={} owner={} branches={}",
+        template_data.height,
+        template_data.owner,
+        template_data.merkle_branches.len()
+    );
+
+    let job_id = {
+        let mut counter = state.job_counter.write().await;
+        *counter += 1;
+        format!("{:08x}", *counter)
+    };
+    let job = create_mining_job_from_template_object(job_id, &template_data);
+    let job_arc = Arc::new(job.clone());
+    {
+        let mut current = state.current_job.write().await;
+        *current = Some(job_arc.clone());
+    }
+    {
+        let mut jobs = state.jobs.write().await;
+        jobs.insert(job.job_id.clone(), job_arc);
+    }
+    info!(
+        "override_job_updater: broadcasting job {} to currently-connected miners",
+        job.job_id
+    );
+    notify_all_miners(&state, &job).await;
+
+    // ASIC firmware (Avalon Nano, Bitaxe, …) enforces a STALE_JOB_TIMEOUT
+    // — typically 60–90 s — and reconnects when no `mining.notify` arrives
+    // in that window. The miner reads the lack of refresh as "connection
+    // dead." We re-broadcast the SAME job every 30 s with the same
+    // `job_id` and the same content; the miner reads it as a heartbeat
+    // and continues hashing. The buyer's template is frozen, so there's
+    // nothing new to publish — just keep ASIC firmware happy.
+    //
+    // When the operator wants a FRESH template (e.g. bitcoind sees a new
+    // tip), they restart the stratum process with a new
+    // `--override-template-id`. No hot-swap path is provided in this
+    // override mode.
+    let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    // Skip the first tick (we just broadcast above).
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let heartbeat = {
+            let current = state.current_job.read().await;
+            current.as_ref().map(|j| (**j).clone())
+        };
+        if let Some(j) = heartbeat {
+            notify_all_miners(&state, &j).await;
         }
     }
 }

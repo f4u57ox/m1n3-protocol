@@ -22,6 +22,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
+mod price_feeder;
 mod slot_watcher;
 mod stratum_proxy;
 mod sui_sender;
@@ -130,6 +131,110 @@ pub struct Args {
     /// Auto-sell order expiry, Unix milliseconds. 0 = no expiry.
     #[arg(long, default_value = "0")]
     pub auto_sell_expires_ms: u64,
+
+    // ── Peg-to-market sell pricing (overrides --auto-sell-price-mist) ────
+    //
+    // When --auto-sell-peg is set, the sidecar computes a target price from
+    // the live orderbook each batch:
+    //
+    //   target = anchor * (1 + offset_bps/10000)
+    //
+    // …where `anchor` is the best bid (mid|bid|ask). If the miner has an
+    // existing live SellOrder, it's topped-up with the new batch's coins
+    // and its price retargeted via `update_sell_order_price`. Otherwise
+    // a fresh order is placed.
+    //
+    //   --auto-sell-peg mid           # follow the market mid
+    //   --auto-sell-offset-bps -50    # 0.5% below mid
+    //   --auto-sell-fallback-mist 1000   # used when orderbook is empty
+    //
+    // Set --auto-sell-peg "" (empty) to disable.
+
+    /// Orderbook anchor: `mid` | `bid` | `ask`. Empty disables.
+    #[arg(long, default_value = "")]
+    pub auto_sell_peg: String,
+
+    /// Signed bps offset from the anchor (+100 = +1%, -50 = -0.5%).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub auto_sell_offset_bps: i32,
+
+    /// Fallback floor in MIST/unit when the orderbook gives no anchor.
+    /// 0 means "skip the batch when orderbook is empty".
+    #[arg(long, default_value = "0")]
+    pub auto_sell_fallback_mist: u64,
+
+    // ── Auto-fill resting bids (Mode 3) ───────────────────────────────────
+    //
+    // When set > 0, the sidecar scans for the best resting BuyOrder above
+    // this floor each batch and fills it via `hash_share_market::fill_buy_order`.
+    // Requires --market-fee-pool to be set.
+    //
+    //   --auto-fill-bid-floor-mist 950
+    //   --market-fee-pool 0x4d3da2…0bba08f9
+    //
+    // If no bid matches the floor, the sidecar falls through to the
+    // auto-sell path (peg if configured, else fixed-floor).
+
+    /// Minimum acceptable bid price in MIST/unit. 0 disables auto-fill.
+    #[arg(long, default_value = "0")]
+    pub auto_fill_bid_floor_mist: u64,
+
+    /// Shared `MarketFeePool` object ID. Required when auto-fill is on.
+    #[arg(long, default_value = "")]
+    pub market_fee_pool: String,
+
+    /// Fully-qualified Move type of the quote coin used by
+    /// `hash_share_market` (e.g. `0xdba34672…::usdc::USDC` on mainnet).
+    /// Empty defaults to SUI — back-compat with the testnet/devnet
+    /// markets that pre-date the `<phantom T, phantom QuoteT>` refactor.
+    /// On mainnet this MUST be set to the native USDC type or every
+    /// auto-sell / auto-fill PTB will fail with a type-arity error.
+    #[arg(long, default_value = "")]
+    pub quote_coin_type: String,
+
+    /// Buyer-template lane: when set, every share batch is submitted via
+    /// `pool::submit_share_for_pay<QuoteT>` against this
+    /// `HashpowerBuyOrder<QuoteT>` instead of the usual `submit_share`.
+    /// The resulting `Coin<QuoteT>` is transferred to the miner inside
+    /// the PTB. HashShare mint + auto-sell + auto-fill are skipped in
+    /// this mode — they're orthogonal to the direct-pay lane.
+    ///
+    /// `--quote-coin-type` must match the order's `QuoteT` generic;
+    /// otherwise the PTB aborts with a type-mismatch.
+    #[arg(long, default_value = "")]
+    pub hashpower_buy_order_id: String,
+
+    // ── Dynamic auto-sell pricing (off-chain feeder) ─────────────────────
+    //
+    // When enabled, a background task fetches live BTC/USD spot from
+    // `--auto-price-api-url`, reads the latest Template's nbits from this
+    // pool's on-chain state, derives the fair-value µUSDC-per-HashShare
+    // floor (canonical PPS formula), and feeds it to the auto-sell logic
+    // every batch. Overrides `--auto-sell-fallback-mist` when active.
+    //
+    // The on-chain Pyth-anchored variant is Phase B (see
+    // `miner-sidecar/src/price_feeder.rs` header for the migration plan).
+
+    /// Enable the off-chain dynamic auto-sell floor feeder.
+    #[arg(long, default_value_t = false)]
+    pub auto_price_feeder: bool,
+
+    /// Price API endpoint. Default = CoinGecko's public BTC/USD simple
+    /// price feed. Format: `{ "bitcoin": { "usd": N } }`.
+    #[arg(
+        long,
+        default_value = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+    )]
+    pub auto_price_api_url: String,
+
+    /// Refresh cadence for the price feeder (seconds). Floored at 15.
+    #[arg(long, default_value = "60")]
+    pub auto_price_refresh_secs: u64,
+
+    /// Operator markup over the fair-value PPS price, in basis points.
+    /// 10_000 = 1.0× (no adjustment). 11_000 = +10%. 9_000 = -10%.
+    #[arg(long, default_value = "10000")]
+    pub auto_price_multiplier_bps: u64,
 }
 
 #[tokio::main]

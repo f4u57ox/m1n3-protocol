@@ -69,6 +69,18 @@ impl SuiTemplateQuerier {
         Self { client, package_id }
     }
 
+    /// Async constructor that does not call `Handle::current().block_on`.
+    /// Use from contexts already inside the tokio runtime (e.g.
+    /// `override_job_updater`). The blocking `new` panics there with
+    /// "Cannot start a runtime from within a runtime".
+    pub async fn new_async(rpc_url: String, package_id: String) -> Result<Self> {
+        let client = SuiClientBuilder::default()
+            .build(&rpc_url)
+            .await
+            .map_err(|e| anyhow!("Cannot connect to Sui RPC: {}", e))?;
+        Ok(Self { client, package_id })
+    }
+
     /// Fetch a specific Template object by its Sui object ID.
     pub async fn fetch_template(&self, template_id: &str) -> Result<TemplateObjectData> {
         let obj_id = ObjectID::from_str(template_id)

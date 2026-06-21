@@ -14,7 +14,7 @@ use sui_sdk::{
         crypto::SuiKeyPair,
         object::Owner,
         programmable_transaction_builder::ProgrammableTransactionBuilder,
-        transaction::{ObjectArg, SharedObjectMutability},
+        transaction::{Argument, Command, ObjectArg, SharedObjectMutability},
         Identifier,
     },
     SuiClient, SuiClientBuilder,
@@ -22,7 +22,7 @@ use sui_sdk::{
 use sui_sdk::rpc_types::SuiTransactionBlockEffectsAPI;
 use tracing::{info, warn};
 
-pub use sui_client::load_keystore;
+pub use sui_client::{load_keystore, load_keystore_by_address};
 
 use crate::MiningJob;
 
@@ -49,7 +49,7 @@ impl SuiSubmitter {
         pool_id_str: String,
         rpc_url: String,
         keystore_path: String,
-        _address: Option<String>,
+        address: Option<String>,
     ) -> Self {
         let package_id = if package_id_str.is_empty() {
             info!("No --sui-package configured — on-chain features disabled");
@@ -70,8 +70,17 @@ impl SuiSubmitter {
             })
         };
 
-        let keypair = load_keystore(&keystore_path)
-            .expect("Failed to load Sui keystore");
+        // When --sui-address is set, pin the signer to that exact address
+        // — bypassing the CLI's active_address state. This matters for
+        // operators driving mainnet from a machine whose CLI active address
+        // points elsewhere (e.g. a devnet wallet from earlier work).
+        let keypair = match address.as_deref() {
+            Some(addr) if !addr.is_empty() => {
+                load_keystore_by_address(&keystore_path, addr)
+                    .expect("Failed to load Sui keystore by address")
+            }
+            _ => load_keystore(&keystore_path).expect("Failed to load Sui keystore"),
+        };
 
         let sender = SuiAddress::from(&keypair.public());
 
@@ -172,12 +181,24 @@ impl SuiSubmitter {
     async fn try_register_template(&self, job: &MiningJob) -> Result<String> {
         let package_id = self.package_id.ok_or_else(|| anyhow!("sui_package not configured"))?;
         let pool_id = self.pool_id.ok_or_else(|| anyhow!("pool_object not configured"))?;
-        let cap_id = self.pool_admin_cap_id
-            .ok_or_else(|| anyhow!("pool_admin_cap_id required for register_template"))?;
+
+        // ── Mode selection ──────────────────────────────────────────────
+        //
+        // Cap set   → "operator mode": call pool::register_template(cap,…).
+        //              The cap is owned by the pool admin; templates carry
+        //              `owner = signer_address` (= the admin).
+        // Cap unset → "buyer mode":   call pool::register_template_public(fee,…),
+        //              paying the `PERMISSIONLESS_TEMPLATE_FEE_MIST` (0.01 SUI)
+        //              anti-spam fee from gas. Resulting Template.owner =
+        //              signer_address. Buyer-bound V2 orders (where
+        //              order.buyer == signer_address) drain on every share
+        //              against any of these templates — that's the whole point
+        //              of running a buyer-side stratum.
+        let buyer_mode = self.pool_admin_cap_id.is_none();
 
         let mut ptb = ProgrammableTransactionBuilder::new();
 
-        // Pool (shared, mutable) — m1n3_v4 pool::register_template signature
+        // Pool (shared, mutable) — same arg in both modes.
         let pool_iver = get_initial_shared_ver(&self.client, pool_id).await?;
         let pool_arg = ptb.obj(ObjectArg::SharedObject {
             id: pool_id,
@@ -185,10 +206,25 @@ impl SuiSubmitter {
             mutability: SharedObjectMutability::Mutable,
         }).map_err(|e| anyhow!("pool arg: {}", e))?;
 
-        // PoolAdminCap (owned)
-        let (cap_ver, cap_dig) = self.obj_ref_parts(cap_id).await?;
-        let cap_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((cap_id, cap_ver, cap_dig)))
-            .map_err(|e| anyhow!("cap arg: {}", e))?;
+        // The cap / fee differs per mode.
+        let cap_or_fee_arg = if buyer_mode {
+            // Split 0.01 SUI off the gas coin as the public-entry fee.
+            // Resulting NestedResult is consumed by register_template_public.
+            let fee_amount_arg = ptb.pure(10_000_000u64).map_err(|e| anyhow!("fee amount arg: {}", e))?;
+            let split = ptb.command(Command::SplitCoins(
+                Argument::GasCoin,
+                vec![fee_amount_arg],
+            ));
+            match split {
+                Argument::Result(idx) => Argument::NestedResult(idx, 0),
+                other => return Err(anyhow!("expected Argument::Result from SplitCoins, got {:?}", other)),
+            }
+        } else {
+            let cap_id = self.pool_admin_cap_id.unwrap();
+            let (cap_ver, cap_dig) = self.obj_ref_parts(cap_id).await?;
+            ptb.obj(ObjectArg::ImmOrOwnedObject((cap_id, cap_ver, cap_dig)))
+                .map_err(|e| anyhow!("cap arg: {}", e))?
+        };
 
         // Clock (shared, immutable)
         let clock_id = ObjectID::from_str("0x6").unwrap();
@@ -199,7 +235,7 @@ impl SuiSubmitter {
             mutability: SharedObjectMutability::Immutable,
         }).map_err(|e| anyhow!("clock arg: {}", e))?;
 
-        // Pure args
+        // Pure args (identical between modes — same job bytes).
         let height_arg = ptb.pure(job.height).map_err(|e| anyhow!("{}", e))?;
         let prev_hash_arg = ptb.pure(job.prev_block_hash.to_vec()).map_err(|e| anyhow!("{}", e))?;
         let cb1_arg = ptb.pure(job.coinbase1.clone()).map_err(|e| anyhow!("{}", e))?;
@@ -210,12 +246,13 @@ impl SuiSubmitter {
         let nbits_arg = ptb.pure(job.nbits).map_err(|e| anyhow!("{}", e))?;
         let ntime_arg = ptb.pure(job.ntime).map_err(|e| anyhow!("{}", e))?;
 
+        let entry_name = if buyer_mode { "register_template_public" } else { "register_template" };
         ptb.programmable_move_call(
             package_id,
             ident("pool"),
-            ident("register_template"),
+            ident(entry_name),
             vec![],
-            vec![pool_arg, cap_arg, clock_arg, height_arg, prev_hash_arg,
+            vec![pool_arg, cap_or_fee_arg, clock_arg, height_arg, prev_hash_arg,
                  cb1_arg, cb2_arg, branches_arg, version_arg, nbits_arg, ntime_arg],
         );
 
