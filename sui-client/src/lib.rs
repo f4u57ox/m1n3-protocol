@@ -1791,10 +1791,17 @@ impl MinerClient {
         let mrr_id = self.miner_round_registry_id
             .ok_or_else(|| anyhow!("miner_round_registry_id required after trustless cleanup; \
                                    set with `with_miner_round_registry`"))?;
-        let (mrr_ver, _) = self.get_ver(mrr_id).await?;
+        // SharedObject args need `initial_shared_version` (the version at which
+        // the object was first shared — never changes), not the current version.
+        // Passing the current version causes validators to reject the tx, which
+        // the SDK's QuorumDriver retries internally until the 60s deadline
+        // fires — surfacing as "execute_transaction_block: Request timeout".
+        // Latent until the registry has been mutated since init (current != initial).
+        // See `get_initial_shared_ver` docstring.
+        let mrr_iver = self.get_initial_shared_ver(mrr_id).await?;
         let mrr_arg = ptb.obj(ObjectArg::SharedObject {
             id: mrr_id,
-            initial_shared_version: mrr_ver,
+            initial_shared_version: mrr_iver,
             mutability: SharedObjectMutability::Mutable,
         }).map_err(|e| anyhow!("MinerRoundRegistry arg: {}", e))?;
         let round_arg = ptb.pure(round_id).map_err(|e| anyhow!("{}", e))?;
