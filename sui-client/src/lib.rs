@@ -123,7 +123,7 @@ pub struct MinerClient {
     miner_round_stats_id: Option<ObjectID>,
     current_round: u64,
     // template_id (hex str) → ShareDedup object ID
-    share_dedup_ids: HashMap<String, ObjectID>,
+    share_dedup_ids: HashMap<u64, ObjectID>,
 
     // Cached (version, digest) per object — updated from object_changes after each tx.
     obj_vers: HashMap<ObjectID, (SequenceNumber, ObjectDigest)>,
@@ -558,19 +558,18 @@ impl MinerClient {
         }
 
         // 1. Make sure we have MinerStats, MinerRoundStats for the current round,
-        //    and a ShareDedup per unique template in this batch.
+        //    and ONE ShareDedup for this round (shared across every Template in
+        //    the batch — per-round scoping replaced the older per-template one).
         self.ensure_registered().await?;
         self.fetch_pool_round().await?;
         let round_id = self.pool_round;
         self.ensure_round_stats(round_id).await?;
+        self.ensure_share_dedup(round_id).await?;
 
         let mut unique_templates: Vec<String> =
             batch.iter().map(|(t, _)| t.clone()).collect();
         unique_templates.sort();
         unique_templates.dedup();
-        for tid in &unique_templates {
-            self.ensure_share_dedup(tid).await?;
-        }
 
         let mut ptb = ProgrammableTransactionBuilder::new();
 
@@ -591,9 +590,16 @@ impl MinerClient {
         let mrs_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((mrs_id, mrs_ver, mrs_dig)))
             .map_err(|e| anyhow!("miner_round_stats arg: {}", e))?;
 
-        // Per-template args: Template (frozen → immutable) + ShareDedup (owned, mutable)
+        // Single ShareDedup arg for the round.
+        let dedup_id = *self.share_dedup_ids.get(&round_id)
+            .ok_or_else(|| anyhow!("share_dedup not set for round {}", round_id))?;
+        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+        let dedup_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+            .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
+
+        // Per-template Template args (still per-template because each share
+        // references its own Template object).
         let mut tpl_args: HashMap<String, sui_sdk::types::transaction::Argument> = HashMap::new();
-        let mut dedup_args: HashMap<String, sui_sdk::types::transaction::Argument> = HashMap::new();
         for tid in &unique_templates {
             let tpl_obj_id = ObjectID::from_str(tid)
                 .map_err(|_| anyhow!("Invalid template ID: {}", tid))?;
@@ -601,13 +607,6 @@ impl MinerClient {
             let tpl_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((tpl_obj_id, tpl_ver, tpl_dig)))
                 .map_err(|e| anyhow!("template arg: {}", e))?;
             tpl_args.insert(tid.clone(), tpl_arg);
-
-            let dedup_id = *self.share_dedup_ids.get(tid)
-                .ok_or_else(|| anyhow!("share_dedup not set for template {}", tid))?;
-            let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
-            let d_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
-                .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
-            dedup_args.insert(tid.clone(), d_arg);
         }
 
         // If HashShare minting is configured, add the registry + cap as PTB
@@ -657,7 +656,6 @@ impl MinerClient {
         // and route the resulting Coin to the miner's wallet.
         for (template_id, share) in batch {
             let tpl_arg = *tpl_args.get(template_id).unwrap();
-            let dedup_arg = *dedup_args.get(template_id).unwrap();
 
             let en1_arg = ptb.pure(share.extranonce1.clone())
                 .map_err(|e| anyhow!("en1 arg: {}", e))?;
@@ -752,20 +750,16 @@ impl MinerClient {
         let round_id = self.pool_round;
         self.ensure_round_stats(round_id).await?;
 
-        // Per-template dedup objects — one per *distinct* template the
-        // batch references. Unlike V1's override-to-buyer's-template
-        // approach, V2 honors the share's actual template id: any
-        // template owned by the buyer drains the order, and shares
-        // hashed against different buyer templates retain their own
-        // dedup envelopes (so re-publishing a template doesn't drag
-        // stale dedup state with it).
+        // Single per-round dedup — same scoping as the regular pool path.
+        // DerivedTemplate inherits round_id from its parent at derivation,
+        // so the on-chain `submit_share_for_buyer_pay` check passes against
+        // any of the buyer's templates within the round.
+        self.ensure_share_dedup(round_id).await?;
+
         let mut unique_templates: Vec<String> =
             batch.iter().map(|(t, _)| t.clone()).collect();
         unique_templates.sort();
         unique_templates.dedup();
-        for tid in &unique_templates {
-            self.ensure_share_dedup(tid).await?;
-        }
 
         let order_id = self
             .hashpower_buy
@@ -798,11 +792,18 @@ impl MinerClient {
             .obj(ObjectArg::ImmOrOwnedObject((mrs_id, mrs_ver, mrs_dig)))
             .map_err(|e| anyhow!("miner_round_stats arg: {}", e))?;
 
-        // Per-template args: Template (frozen → ImmOrOwnedObject) +
-        // ShareDedup (owned, mutable).
+        // Single ShareDedup arg for this round.
+        let dedup_id = *self
+            .share_dedup_ids
+            .get(&round_id)
+            .ok_or_else(|| anyhow!("share_dedup not set for round {}", round_id))?;
+        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+        let dedup_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+            .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
+
+        // Per-template Template args.
         let mut tpl_args: HashMap<String, sui_sdk::types::transaction::Argument> =
-            HashMap::new();
-        let mut dedup_args: HashMap<String, sui_sdk::types::transaction::Argument> =
             HashMap::new();
         for tid in &unique_templates {
             let tpl_obj_id = ObjectID::from_str(tid)
@@ -812,16 +813,6 @@ impl MinerClient {
                 .obj(ObjectArg::ImmOrOwnedObject((tpl_obj_id, tpl_ver, tpl_dig)))
                 .map_err(|e| anyhow!("template arg: {}", e))?;
             tpl_args.insert(tid.clone(), tpl_arg);
-
-            let dedup_id = *self
-                .share_dedup_ids
-                .get(tid)
-                .ok_or_else(|| anyhow!("share_dedup not set for template {}", tid))?;
-            let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
-            let d_arg = ptb
-                .obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
-                .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
-            dedup_args.insert(tid.clone(), d_arg);
         }
 
         // BuyerHashpowerOrder<QuoteT> (shared mutable). Take it ONCE
@@ -844,7 +835,6 @@ impl MinerClient {
 
         for (template_id, share) in batch {
             let tpl_arg = *tpl_args.get(template_id).unwrap();
-            let dedup_arg = *dedup_args.get(template_id).unwrap();
             let en1_arg = ptb
                 .pure(share.extranonce1.clone())
                 .map_err(|e| anyhow!("en1 arg: {}", e))?;
@@ -1840,15 +1830,13 @@ impl MinerClient {
         Ok(())
     }
 
-    async fn ensure_share_dedup(&mut self, template_id: &str) -> Result<()> {
-        if self.share_dedup_ids.contains_key(template_id) {
+    async fn ensure_share_dedup(&mut self, round_id: u64) -> Result<()> {
+        if self.share_dedup_ids.contains_key(&round_id) {
             return Ok(());
         }
-        let tpl_obj_id = ObjectID::from_str(template_id)
-            .map_err(|_| anyhow!("Invalid template ID: {}", template_id))?;
         let dedup_type = format!("{}::share_dedup::ShareDedup", self.package_id);
-        if let Some(id) = self.find_owned_dedup(&dedup_type, template_id).await? {
-            self.share_dedup_ids.insert(template_id.to_string(), id);
+        if let Some(id) = self.find_owned_dedup(&dedup_type, round_id).await? {
+            self.share_dedup_ids.insert(round_id, id);
             return Ok(());
         }
         let mut ptb = ProgrammableTransactionBuilder::new();
@@ -1859,13 +1847,13 @@ impl MinerClient {
             initial_shared_version: reg_iver,
             mutability: SharedObjectMutability::Mutable,
         }).map_err(|e| anyhow!("dedup_registry arg: {}", e))?;
-        let tpl_arg = ptb.pure(tpl_obj_id).map_err(|e| anyhow!("{}", e))?;
+        let round_arg = ptb.pure(round_id).map_err(|e| anyhow!("{}", e))?;
         ptb.programmable_move_call(
             self.package_id,
             ident("share_dedup"),
             ident("create_share_dedup"),
             vec![],
-            vec![reg_arg, tpl_arg],
+            vec![reg_arg, round_arg],
         );
         let resp = self.exec(ptb.finish()).await?;
 
@@ -1885,11 +1873,11 @@ impl MinerClient {
         let id = if let Some(id) = id_from_changes {
             id
         } else {
-            self.find_owned_dedup(&dedup_type, template_id).await?
+            self.find_owned_dedup(&dedup_type, round_id).await?
                 .ok_or_else(|| anyhow!("ShareDedup not found after creation"))?
         };
-        self.share_dedup_ids.insert(template_id.to_string(), id);
-        info!("Created ShareDedup for template {}: {}", template_id, id);
+        self.share_dedup_ids.insert(round_id, id);
+        info!("Created ShareDedup for round {}: {}", round_id, id);
         Ok(())
     }
 
@@ -2074,7 +2062,7 @@ impl MinerClient {
     async fn find_owned_dedup(
         &self,
         struct_type: &str,
-        template_id: &str,
+        round_id: u64,
     ) -> Result<Option<ObjectID>> {
         let filter = SuiObjectDataFilter::StructType(
             struct_type.parse().map_err(|e| anyhow!("Bad type: {}", e))?,
@@ -2095,8 +2083,13 @@ impl MinerClient {
             if let Some(data) = &item.data {
                 if let Some(content) = &data.content {
                     let json = serde_json::to_value(content).unwrap_or_default();
-                    let tid = json["fields"]["template_id"].as_str().unwrap_or("");
-                    if tid.eq_ignore_ascii_case(template_id) {
+                    let r = json["fields"]["round_id"]
+                        .as_u64()
+                        .or_else(|| {
+                            json["fields"]["round_id"].as_str().and_then(|s| s.parse().ok())
+                        })
+                        .unwrap_or(u64::MAX);
+                    if r == round_id {
                         return Ok(Some(data.object_id));
                     }
                 }

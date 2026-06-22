@@ -119,7 +119,7 @@ module m1n3_v4::pool_core_tests {
             let template = ts::take_immutable<Template>(sc);
             let tid = pool::template_id(&template);
             let mut registry = ts::take_shared<ShareDedupRegistry>(sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(sc));
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -417,7 +417,7 @@ module m1n3_v4::pool_core_tests {
             let template = ts::take_immutable<Template>(&sc);
             let tid = pool::template_id(&template);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(&mut sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -435,7 +435,7 @@ module m1n3_v4::pool_core_tests {
             let template = ts::take_immutable<Template>(&sc);
             let tid = pool::template_id(&template);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(&mut sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -553,8 +553,8 @@ module m1n3_v4::pool_core_tests {
             let template = ts::take_immutable<Template>(&sc);
             let tid = pool::template_id(&template);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(&mut sc)); // OK
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(&mut sc)); // aborts here
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(&mut sc)); // OK
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(&mut sc)); // aborts here
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -1148,7 +1148,7 @@ module m1n3_v4::pool_core_tests {
             let parent = ts::take_immutable<Template>(sc);
             let tid = pool::template_id(&parent);
             let mut registry = ts::take_shared<ShareDedupRegistry>(sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(sc));
+            share_dedup::create_share_dedup(&mut registry, ROUND_0, ts::ctx(sc));
             ts::return_shared(registry);
             ts::return_immutable(parent);
         };
@@ -1391,9 +1391,9 @@ module m1n3_v4::pool_core_tests {
         ts::next_tx(&mut sc, MINER_A);
         {
             let derived = ts::take_immutable<m1n3_v4::pool::DerivedTemplate>(&sc);
-            let derived_id = object::id(&derived);
+            let derived_round = pool::derived_template_round_id(&derived);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&sc);
-            share_dedup::create_share_dedup(&mut registry, derived_id, ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, derived_round, ts::ctx(&mut sc));
             ts::return_shared(registry);
             ts::return_immutable(derived);
         };

@@ -84,7 +84,7 @@ module m1n3_v4::pool {
     #[error]
     const EInvalidNtime: vector<u8> = b"Share ntime is outside the allowed window (too old or too far in future)";
     #[error]
-    const EWrongTemplate: vector<u8> = b"Share references a template that does not belong to this pool";
+    const EWrongTemplate: vector<u8> = b"ShareDedup.round_id does not match the template's round_id";
     #[error]
     const EWrongMiner: vector<u8> = b"MinerRoundStats does not belong to the transaction sender";
     #[error]
@@ -580,6 +580,9 @@ module m1n3_v4::pool {
     public struct DerivedTemplate has key {
         id: UID,
         parent_template_id: ID,
+        /// Inherited from the parent at derivation time. Lets `submit_share_for_pay`
+        /// share the per-(miner, round) ShareDedup scoping with the regular path.
+        round_id: u64,
         height: u64,
         prev_block_hash: vector<u8>,
         coinbase1: vector<u8>,
@@ -723,6 +726,7 @@ module m1n3_v4::pool {
         let derived = DerivedTemplate {
             id: object::new(ctx),
             parent_template_id: object::id(parent),
+            round_id: parent.round_id,
             height: parent.height,
             prev_block_hash: parent.prev_block_hash,
             coinbase1,
@@ -1053,7 +1057,7 @@ module m1n3_v4::pool {
 
         assert!(miner::miner_address(miner_stats) == sender, EWrongMiner);
         assert!(share_dedup::miner(share_dedup) == sender, EWrongMiner);
-        assert!(share_dedup::template_id(share_dedup) == object::id(template), EWrongTemplate);
+        assert!(share_dedup::round_id(share_dedup) == template.round_id, EWrongTemplate);
 
         assert!((version ^ template.version) & (0xFFFFFFFF ^ VERSION_ROLLING_MASK) == 0, EInvalidVersionRolling);
 
@@ -1124,7 +1128,7 @@ module m1n3_v4::pool {
 
         assert!(miner::miner_address(miner_stats) == sender, EWrongMiner);
         assert!(share_dedup::miner(share_dedup) == sender, EWrongMiner);
-        assert!(share_dedup::template_id(share_dedup) == object::id(derived), EWrongTemplate);
+        assert!(share_dedup::round_id(share_dedup) == derived.round_id, EWrongTemplate);
 
         assert!((version ^ derived.version) & (0xFFFFFFFF ^ VERSION_ROLLING_MASK) == 0, EInvalidVersionRolling);
 
@@ -1209,6 +1213,7 @@ module m1n3_v4::pool {
 
     public fun derived_template_parent(d: &DerivedTemplate): ID { d.parent_template_id }
     public fun derived_template_height(d: &DerivedTemplate): u64 { d.height }
+    public fun derived_template_round_id(d: &DerivedTemplate): u64 { d.round_id }
     public fun derived_template_owner(d: &DerivedTemplate): address { d.owner }
     public fun derived_template_min_difficulty(d: &DerivedTemplate): u64 { d.min_difficulty }
     public fun derived_template_network_difficulty(d: &DerivedTemplate): u64 { d.cached_network_difficulty }
@@ -1593,7 +1598,7 @@ module m1n3_v4::pool {
         // Ownership checks — miner must own the objects they pass.
         assert!(miner::miner_address(miner_stats) == sender, EWrongMiner);
         assert!(share_dedup::miner(share_dedup) == sender, EWrongMiner);
-        assert!(share_dedup::template_id(share_dedup) == object::id(template), EWrongTemplate);
+        assert!(share_dedup::round_id(share_dedup) == template.round_id, EWrongTemplate);
 
         // Template validity.
         assert!((version ^ template.version) & (0xFFFFFFFF ^ VERSION_ROLLING_MASK) == 0, EInvalidVersionRolling);

@@ -1,27 +1,37 @@
-/// Per-(template, miner) share deduplication object.
+/// Per-(round, miner) share deduplication object.
 ///
-/// Each miner owns a separate ShareDedup for each template they mine against.
-/// Hash lookup is O(1) via dynamic_field::exists. No shared state involved —
+/// Each miner owns ONE ShareDedup per round, reused across every Template
+/// the pool publishes within that round. Hash lookup is O(1) via
+/// `dynamic_field::exists`. No shared state involved on the share hot path —
 /// all reads and writes bypass Sui consensus entirely.
 ///
-/// Uniqueness enforcement (C-1 fix):
-///   ShareDedupRegistry is a shared object keyed by (miner, template_id).
+/// Previously scoped per-(template, miner), which forced a fresh
+/// `create_share_dedup` PTB every ~30 s as stratum rotated templates. At
+/// 1 share / ~14 min on a 5 TH/s ASIC this was ~14 dedup objects/day per
+/// miner. Scoping by round instead of template shrinks that to one per
+/// round per miner without weakening the dedup guarantee: share hashes
+/// remain globally unique across templates within a round (the coinbase
+/// embeds the unique merkle root, so two templates produce different
+/// share hashes for the same `(extranonce, ntime, nonce)` tuple).
+///
+/// Uniqueness enforcement (C-1 fix, preserved):
+///   ShareDedupRegistry is a shared object keyed by (miner, round_id).
 ///   create_share_dedup registers the pair and aborts if one already exists,
-///   preventing a miner from creating N dedup objects for the same template and
+///   preventing a miner from creating N dedup objects for the same round and
 ///   submitting the same share hash N times to inflate their pool-reward work.
 ///   Registry entries are permanent: deleting a ShareDedup does not remove the
 ///   entry, so a delete-and-recreate cannot bypass the protection.
 ///
 /// Storage rent model (Sui):
 ///   Each dynamic field (hash entry) costs ~40 bytes of on-chain storage.
-///   When the template is deactivated the miner calls close_share_dedup to
-///   reclaim all storage and the SUI rebate is credited back to the miner.
+///   Once a round is finalised the miner calls close_share_dedup to drain
+///   hashes and reclaim storage rent (refunded to the miner).
 ///
 /// Lifecycle:
-///   create_share_dedup → registers (miner, template_id) in ShareDedupRegistry;
+///   create_share_dedup → registers (miner, round_id) in ShareDedupRegistry;
 ///                        creates a ShareDedup owned by the miner
 ///   record_hash        → called by pool::submit_share on each accepted share
-///   close_share_dedup  → miner calls after template is deactivated (drains hashes)
+///   close_share_dedup  → miner calls after round is finalised (drains hashes)
 ///   delete_share_dedup → permanently deletes the empty ShareDedup object
 module m1n3_v4::share_dedup {
     use sui::dynamic_field;
@@ -29,23 +39,23 @@ module m1n3_v4::share_dedup {
     // ── Error codes ───────────────────────────────────────────────────────────
 
     #[error]
-    const EDuplicateShare: vector<u8> = b"This share hash has already been submitted by this miner against this template";
+    const EDuplicateShare: vector<u8> = b"This share hash has already been submitted by this miner in this round";
     #[error]
-    const EAlreadyRegistered: vector<u8> = b"A ShareDedup already exists for this (miner, template) pair";
+    const EAlreadyRegistered: vector<u8> = b"A ShareDedup already exists for this (miner, round) pair";
     #[error]
     const ENotOwner: vector<u8> = b"Caller is not the owner of this ShareDedup";
 
     // ── Registry key ─────────────────────────────────────────────────────────
 
-    /// Dynamic-field key for ShareDedupRegistry. One entry per (miner, template).
+    /// Dynamic-field key for ShareDedupRegistry. One entry per (miner, round).
     public struct ShareDedupKey has copy, drop, store {
         miner: address,
-        template_id: ID,
+        round_id: u64,
     }
 
     // ── Objects ───────────────────────────────────────────────────────────────
 
-    /// Shared registry that enforces one ShareDedup per (miner, template_id) pair.
+    /// Shared registry that enforces one ShareDedup per (miner, round_id) pair.
     /// Dynamic fields: ShareDedupKey → bool (true = registered).
     public struct ShareDedupRegistry has key {
         id: UID,
@@ -54,7 +64,7 @@ module m1n3_v4::share_dedup {
     /// Owned by the miner. Dynamic fields store accepted share hashes.
     public struct ShareDedup has key {
         id: UID,
-        template_id: ID,
+        round_id: u64,
         miner: address,
         count: u32,
     }
@@ -68,28 +78,28 @@ module m1n3_v4::share_dedup {
 
     // ── Entry functions ───────────────────────────────────────────────────────
 
-    /// Create a new ShareDedup for a (template, miner) pair.
-    /// Aborts with EAlreadyRegistered if this (miner, template) pair was already registered.
-    /// Call this before submitting the first share for a template.
+    /// Create a new ShareDedup for a (round, miner) pair.
+    /// Aborts with EAlreadyRegistered if this (miner, round) pair was already registered.
+    /// Call this before submitting the first share for a round.
     public fun create_share_dedup(
         registry: &mut ShareDedupRegistry,
-        template_id: ID,
+        round_id: u64,
         ctx: &mut TxContext,
     ) {
         let sender = tx_context::sender(ctx);
-        let key = ShareDedupKey { miner: sender, template_id };
+        let key = ShareDedupKey { miner: sender, round_id };
         assert!(!dynamic_field::exists(&registry.id, key), EAlreadyRegistered);
         dynamic_field::add(&mut registry.id, key, true);
         let dedup = ShareDedup {
             id: object::new(ctx),
-            template_id,
+            round_id,
             miner: sender,
             count: 0,
         };
         transfer::transfer(dedup, sender);
     }
 
-    /// Reclaim storage rent after the template is deactivated.
+    /// Reclaim storage rent after the round is finalised.
     /// Pass the hashes to remove (obtained off-chain from the miner's event log).
     /// Call multiple times if the hash list is large.
     public fun close_share_dedup(
@@ -111,13 +121,13 @@ module m1n3_v4::share_dedup {
     }
 
     /// Permanently delete the ShareDedup object once all hashes are removed.
-    /// Note: the registry entry for (miner, template_id) is kept permanently so
+    /// Note: the registry entry for (miner, round_id) is kept permanently so
     /// this dedup cannot be recreated after deletion (prevents the delete-and-
     /// recreate bypass attack).
     public fun delete_share_dedup(dedup: ShareDedup, ctx: &mut TxContext) {
         assert!(dedup.miner == tx_context::sender(ctx), ENotOwner);
         assert!(dedup.count == 0, EDuplicateShare); // must drain first
-        let ShareDedup { id, template_id: _, miner: _, count: _ } = dedup;
+        let ShareDedup { id, round_id: _, miner: _, count: _ } = dedup;
         object::delete(id);
     }
 
@@ -133,7 +143,7 @@ module m1n3_v4::share_dedup {
 
     // ── Read accessors ────────────────────────────────────────────────────────
 
-    public fun template_id(dedup: &ShareDedup): ID { dedup.template_id }
+    public fun round_id(dedup: &ShareDedup): u64 { dedup.round_id }
     public fun miner(dedup: &ShareDedup): address { dedup.miner }
     public fun count(dedup: &ShareDedup): u32 { dedup.count }
 

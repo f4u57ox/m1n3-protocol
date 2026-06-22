@@ -270,7 +270,7 @@ module m1n3_v4::stale_template_tests {
         {
             let template = ts::take_immutable<Template>(&sc);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, pool::template_id(&template), ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, pool::template_round_id(&template), ts::ctx(&mut sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -325,7 +325,7 @@ module m1n3_v4::stale_template_tests {
         {
             let template = ts::take_immutable<Template>(&sc);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, pool::template_id(&template), ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, pool::template_round_id(&template), ts::ctx(&mut sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
@@ -363,53 +363,38 @@ module m1n3_v4::stale_template_tests {
         setup(&mut sc);
 
         // Register T_old (height=800000) first, then T_new (height=800001).
-        // ShareDedup for T_old is created while only T_old is frozen, so
-        // take_immutable<Template> unambiguously returns T_old.
+        // Under per-round dedup, both templates share the SAME ShareDedup
+        // (one per (miner, round) pair, not per (miner, template)).
         register_at(&mut sc, 800000);
-
-        ts::next_tx(&mut sc, MINER);
-        {
-            let t_old = ts::take_immutable<Template>(&sc);
-            // Capture T_old's id for the dedup object before T_new is registered.
-            let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, pool::template_id(&t_old), ts::ctx(&mut sc));
-            ts::return_shared(registry);
-            ts::return_immutable(t_old);
-        };
-
-        // Now register the newer template.
         register_at(&mut sc, 800001);
 
-        // Create ShareDedup for T_new and the MRS (anchored at pool.current_height=800001).
         ts::next_tx(&mut sc, MINER);
         let pool = ts::take_shared<Pool>(&sc);
-        let r2 = pool::current_round(&pool);
-        let h2 = pool::current_height(&pool); // = 800001
+        let round = pool::current_round(&pool);
+        let height = pool::current_height(&pool); // = 800001
         ts::return_shared(pool);
-        create_round_stats_for(&mut sc, MINER, r2, h2);
+        create_round_stats_for(&mut sc, MINER, round, height);
+
+        // One ShareDedup for the round — handles both T_old and T_new.
         ts::next_tx(&mut sc, MINER);
         {
-            // take_immutable returns the most recently frozen object → T_new.
-            let t_new = ts::take_immutable<Template>(&sc);
             let mut registry = ts::take_shared<ShareDedupRegistry>(&mut sc);
-            share_dedup::create_share_dedup(&mut registry, pool::template_id(&t_new), ts::ctx(&mut sc));
+            share_dedup::create_share_dedup(&mut registry, round, ts::ctx(&mut sc));
             ts::return_shared(registry);
-            ts::return_immutable(t_new);
         };
 
         // Submit one share to T_new (height=800001) — ratchets min_height to 800001.
         ts::next_tx(&mut sc, MINER);
         {
+            // take_immutable returns the most recently frozen Template → T_new.
             let t_new  = ts::take_immutable<Template>(&sc);
             let mut ms = ts::take_from_sender<MinerStats>(&sc);
             let mut mrs = ts::take_from_sender<MinerRoundStats>(&sc);
-            // Two ShareDedup objects exist; take_from_sender returns the most recent.
-            // The most recently created dedup is for T_new.
-            let mut sd_new: m1n3_v4::share_dedup::ShareDedup = ts::take_from_sender(&sc);
+            let mut sd: m1n3_v4::share_dedup::ShareDedup = ts::take_from_sender(&sc);
             let clk = clock::create_for_testing(ts::ctx(&mut sc));
 
             let _receipt = pool::submit_share(
-                &t_new, &mut ms, &mut mrs, &mut sd_new,
+                &t_new, &mut ms, &mut mrs, &mut sd,
                 x"aabbccdd", x"11223344", 0u32, 7u32, ver(),
                 &clk, ts::ctx(&mut sc),
             );
@@ -420,7 +405,7 @@ module m1n3_v4::stale_template_tests {
             ts::return_immutable(t_new);
             ts::return_to_sender(&sc, ms);
             ts::return_to_sender(&sc, mrs);
-            ts::return_to_sender(&sc, sd_new);
+            ts::return_to_sender(&sc, sd);
         };
 
         // Now try to submit to T_old (height=800000) — must abort with EStaleTemplate.
@@ -431,15 +416,12 @@ module m1n3_v4::stale_template_tests {
             let t_old = ts::take_immutable<Template>(&sc);
             let mut ms  = ts::take_from_sender<MinerStats>(&sc);
             let mut mrs = ts::take_from_sender<MinerRoundStats>(&sc);
-            // sd_old was created first (before T_new was registered), so it's the
-            // second take_from_sender for ShareDedup.
-            let sd_new_again: m1n3_v4::share_dedup::ShareDedup = ts::take_from_sender(&sc);
-            let mut sd_old: m1n3_v4::share_dedup::ShareDedup  = ts::take_from_sender(&sc);
+            let mut sd: m1n3_v4::share_dedup::ShareDedup = ts::take_from_sender(&sc);
             let clk = clock::create_for_testing(ts::ctx(&mut sc));
 
             // t_old.height=800000 < mrs.min_height=800001 → EStaleTemplate
             let _receipt = pool::submit_share(
-                &t_old, &mut ms, &mut mrs, &mut sd_old,
+                &t_old, &mut ms, &mut mrs, &mut sd,
                 x"aabbccdd", x"11223344", 0u32, 99u32, ver(),
                 &clk, ts::ctx(&mut sc),
             );
@@ -449,8 +431,7 @@ module m1n3_v4::stale_template_tests {
             ts::return_immutable(t_old);
             ts::return_to_sender(&sc, ms);
             ts::return_to_sender(&sc, mrs);
-            ts::return_to_sender(&sc, sd_new_again);
-            ts::return_to_sender(&sc, sd_old);
+            ts::return_to_sender(&sc, sd);
         };
         ts::end(sc);
     }

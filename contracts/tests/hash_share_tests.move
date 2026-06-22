@@ -141,9 +141,9 @@ module m1n3_v4::hash_share_tests {
         ts::next_tx(sc, addr);
         {
             let template = ts::take_immutable<m1n3_v4::pool::Template>(sc);
-            let tid = pool::template_id(&template);
+            let round = pool::template_round_id(&template);
             let mut registry = ts::take_shared<ShareDedupRegistry>(sc);
-            share_dedup::create_share_dedup(&mut registry, tid, ts::ctx(sc));
+            share_dedup::create_share_dedup(&mut registry, round, ts::ctx(sc));
             ts::return_shared(registry);
             ts::return_immutable(template);
         };
