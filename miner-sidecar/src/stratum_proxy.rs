@@ -34,6 +34,14 @@ pub async fn run(args: Args) -> Result<()> {
         info!("MinerRoundRegistry wired: {}", mrr);
     }
 
+    if let Some(path) = args.state_file.as_deref() {
+        sender = sender.with_state_file(std::path::PathBuf::from(path));
+        if let Err(e) = sender.load_state() {
+            tracing::warn!("load_state failed: {}", e);
+        }
+        info!("State file wired: {}", path);
+    }
+
     if !args.quote_coin_type.is_empty() {
         sender = sender.with_quote_type(&args.quote_coin_type)?;
         info!("Quote coin type set: {}", args.quote_coin_type);

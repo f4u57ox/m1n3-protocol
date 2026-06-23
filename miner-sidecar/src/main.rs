@@ -78,6 +78,15 @@ pub struct Args {
     #[arg(long, default_value = "10000000")]
     pub gas_budget: u64,
 
+    /// Optional state file for persisting bootstrap cache (MinerStats /
+    /// MinerRoundStats / ShareDedup ids) across restarts. When set, the
+    /// sidecar reads it on startup and writes it on every cache change —
+    /// skipping `register_miner` + `create_round_stats` + `create_share_dedup`
+    /// round-trips on subsequent runs. Stored as JSON with mode 0600.
+    /// Recommended path: `~/.sui/m1n3-sidecar-state.json`.
+    #[arg(long)]
+    pub state_file: Option<String>,
+
     // ── Optional HashShare mint ─────────────────────────────────────────
     //
     // When the registry flag is set, every share submitted via the sidecar

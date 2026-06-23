@@ -25,10 +25,12 @@
 use anyhow::{anyhow, Result};
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     str::FromStr,
     sync::{atomic::AtomicU64, Arc},
     time::{Duration, Instant},
 };
+use serde::{Deserialize, Serialize};
 use sui_sdk::{
     rpc_types::{
         EventFilter, ObjectChange, SuiObjectDataFilter, SuiObjectDataOptions,
@@ -198,6 +200,37 @@ pub struct MinerClient {
     // the same PTB. No HashShare minting, no auto-sell, no round binding
     // beyond what MinerRoundStats already requires.
     hashpower_buy: Option<HashpowerBuyConfig>,
+
+    // Optional disk persistence for the bootstrap cache. When set, the
+    // sidecar writes `miner_stats_id` / `miner_round_stats_id` /
+    // `share_dedup_ids` / `accumulated_rounds` to this path on every
+    // change and reloads them on restart, skipping `register_miner` +
+    // `create_round_stats` + `create_share_dedup` round-trips.
+    state_file: Option<PathBuf>,
+}
+
+/// On-disk shape for the sidecar's bootstrap cache. Versioned in case the
+/// schema evolves. Stored as JSON because the contents are small and
+/// debuggability beats binary efficiency here.
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    version: u32,
+    package_id: String,
+    address: String,
+    miner_stats_id: Option<String>,
+    miner_round_stats_id: Option<String>,
+    current_round: u64,
+    share_dedup_ids: HashMap<String, String>,
+    accumulated_rounds: Vec<u64>,
+}
+
+fn parse_optional_id(s: &Option<String>) -> Result<Option<ObjectID>> {
+    match s {
+        None => Ok(None),
+        Some(raw) => Ok(Some(
+            ObjectID::from_str(raw).map_err(|_| anyhow!("Invalid persisted ObjectID: {}", raw))?,
+        )),
+    }
 }
 
 /// Buyer-bound (V2) lane config. The sidecar drains the configured
@@ -378,11 +411,108 @@ impl MinerClient {
                 .expect("SUI type tag is well-known"),
             dynamic_floor_mist: None,
             hashpower_buy: None,
+            state_file: None,
         })
     }
 
     pub fn address(&self) -> SuiAddress {
         self.address
+    }
+
+    /// Persist bootstrap state (MinerStats / MinerRoundStats / ShareDedup IDs)
+    /// to `path` so a sidecar restart can skip the on-chain `register_miner` +
+    /// `create_round_stats` + `create_share_dedup` round-trips. The file is
+    /// written with mode 0600 and updated atomically (temp + rename) every
+    /// time the cache changes. `load_state` reads it on startup.
+    pub fn with_state_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.state_file = Some(path.into());
+        self
+    }
+
+    /// Apply state previously saved by `save_state`. Silently no-ops if the
+    /// file doesn't exist, fails to parse, or was written for a different
+    /// package/address (a sidecar repointed at a new package re-bootstraps
+    /// rather than reusing stale ids).
+    pub fn load_state(&mut self) -> Result<()> {
+        let path = match &self.state_file {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow!("read state {}: {}", path.display(), e)),
+        };
+        let s: PersistedState = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("state file {} unparseable, ignoring: {}", path.display(), e);
+                return Ok(());
+            }
+        };
+        if s.package_id != self.package_id.to_string()
+            || s.address != self.address.to_string()
+        {
+            info!("state file is for a different package/address, ignoring");
+            return Ok(());
+        }
+        self.miner_stats_id = parse_optional_id(&s.miner_stats_id)?;
+        self.miner_round_stats_id = parse_optional_id(&s.miner_round_stats_id)?;
+        self.current_round = s.current_round;
+        for (round_str, id_str) in &s.share_dedup_ids {
+            if let (Ok(round), Ok(id)) = (round_str.parse::<u64>(), ObjectID::from_str(id_str)) {
+                self.share_dedup_ids.insert(round, id);
+            }
+        }
+        for r in &s.accumulated_rounds {
+            self.accumulated_rounds.insert(*r);
+        }
+        info!(
+            "loaded sidecar state from {} — miner_stats={:?} mrs={:?} round={} dedups={}",
+            path.display(), self.miner_stats_id, self.miner_round_stats_id,
+            self.current_round, self.share_dedup_ids.len()
+        );
+        Ok(())
+    }
+
+    /// Write the current cache to the configured state file. Atomic
+    /// write (temp + rename) with mode 0600. Best-effort: errors are
+    /// logged and swallowed so a transient disk problem doesn't kill the
+    /// share flow.
+    fn save_state(&self) {
+        let path = match &self.state_file {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let s = PersistedState {
+            version: 1,
+            package_id: self.package_id.to_string(),
+            address: self.address.to_string(),
+            miner_stats_id: self.miner_stats_id.as_ref().map(|i| i.to_string()),
+            miner_round_stats_id: self.miner_round_stats_id.as_ref().map(|i| i.to_string()),
+            current_round: self.current_round,
+            share_dedup_ids: self.share_dedup_ids.iter()
+                .map(|(r, id)| (r.to_string(), id.to_string()))
+                .collect(),
+            accumulated_rounds: self.accumulated_rounds.iter().copied().collect(),
+        };
+        let json = match serde_json::to_vec_pretty(&s) {
+            Ok(b) => b,
+            Err(e) => { warn!("serialize state: {}", e); return; }
+        };
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!("write state {}: {}", tmp.display(), e);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            warn!("rename state {}: {}", path.display(), e);
+        }
     }
 
     /// Enable per-share HashShare minting in the same PTB as `submit_share`.
@@ -504,6 +634,7 @@ impl MinerClient {
         if let Some(id) = self.find_owned_id(&stats_type).await? {
             info!("Miner already registered: MinerStats={}", id);
             self.miner_stats_id = Some(id);
+            self.save_state();
             return Ok(());
         }
         let mut ptb = ProgrammableTransactionBuilder::new();
@@ -543,6 +674,7 @@ impl MinerClient {
         } else {
             return Err(anyhow!("MinerStats not found after registration"));
         }
+        self.save_state();
         Ok(())
     }
 
@@ -1665,6 +1797,7 @@ impl MinerClient {
         self.do_accumulate(acc_id, mrs_id).await?;
         self.accumulated_rounds.insert(round_id);
         info!("Accumulated round {} stats into accumulator {}", round_id, acc_id);
+        self.save_state();
         Ok(())
     }
 
@@ -1775,6 +1908,7 @@ impl MinerClient {
         if let Some(id) = self.find_owned_for_round(&mrs_type, round_id).await? {
             self.current_round = round_id;
             self.miner_round_stats_id = Some(id);
+            self.save_state();
             return Ok(());
         }
         let mut ptb = ProgrammableTransactionBuilder::new();
@@ -1827,6 +1961,7 @@ impl MinerClient {
         self.current_round = round_id;
         self.miner_round_stats_id = Some(id);
         info!("Created MinerRoundStats for round {}: {}", round_id, id);
+        self.save_state();
         Ok(())
     }
 
@@ -1837,6 +1972,7 @@ impl MinerClient {
         let dedup_type = format!("{}::share_dedup::ShareDedup", self.package_id);
         if let Some(id) = self.find_owned_dedup(&dedup_type, round_id).await? {
             self.share_dedup_ids.insert(round_id, id);
+            self.save_state();
             return Ok(());
         }
         let mut ptb = ProgrammableTransactionBuilder::new();
@@ -1878,6 +2014,7 @@ impl MinerClient {
         };
         self.share_dedup_ids.insert(round_id, id);
         info!("Created ShareDedup for round {}: {}", round_id, id);
+        self.save_state();
         Ok(())
     }
 
@@ -2109,17 +2246,59 @@ impl MinerClient {
             &mut self.gas_price, &mut self.gas_price_at, &mut self.gas_coin,
         ).await;
 
-        // If a transaction failed due to a stale owned-object version, drop the
-        // entire version cache so every owned object is re-fetched on the next exec.
+        // On a stale-version error, surgically drop only the cache entries the
+        // validator complained about — not the whole map. Sui error messages
+        // embed the offending object ids in the form `object 0x<hex64>` (and
+        // occasionally bare `0x<hex64>` for gas-coin specifics). Parsing those
+        // out keeps Template / MinerStats / other unaffected entries warm and
+        // avoids 3–4 extra get_object round-trips on the recovery batch. If no
+        // ids parse, fall back to the full clear so we don't risk operating
+        // with a known-stale cache.
         if let Err(ref e) = result {
             let msg = e.to_string();
             if msg.contains("unavailable for consumption") || msg.contains("version") {
-                self.obj_vers.clear();
+                let stale = parse_object_ids(&msg);
+                if stale.is_empty() {
+                    self.obj_vers.clear();
+                } else {
+                    for id in &stale {
+                        self.obj_vers.remove(id);
+                    }
+                }
             }
         }
 
         result
     }
+}
+
+/// Scan a Sui error message for 64-hex-char object ids prefixed by either
+/// `object 0x…` (the validator-side wording) or a bare `0x…` (gas-coin
+/// rejections, etc.). Used by `exec` to invalidate only the specific
+/// version-cache entries the validator complained about.
+fn parse_object_ids(msg: &str) -> Vec<ObjectID> {
+    let mut out = Vec::new();
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b'0' && bytes[i + 1] == b'x' {
+            let hex_start = i + 2;
+            let mut hex_end = hex_start;
+            while hex_end < bytes.len() && bytes[hex_end].is_ascii_hexdigit() {
+                hex_end += 1;
+            }
+            // Sui object ids are 32 bytes = 64 hex chars; accept that exact width.
+            if hex_end - hex_start == 64 {
+                if let Ok(id) = ObjectID::from_str(&msg[i..hex_end]) {
+                    out.push(id);
+                }
+            }
+            i = hex_end.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 // ── Shared standalone helpers ─────────────────────────────────────────────────
