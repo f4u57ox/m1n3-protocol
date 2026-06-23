@@ -698,6 +698,20 @@ impl MinerClient {
         self.ensure_round_stats(round_id).await?;
         self.ensure_share_dedup(round_id).await?;
 
+        // 2. Opportunistic cleanup of ShareDedups from closed rounds. Cheap
+        //    (~1 PTB per dedup, paid in storage rebate not gas), best-effort:
+        //    a failure here doesn't abort the share batch — the cache entry
+        //    is left in place so the next flush retries.
+        let stale_dedup_rounds: Vec<u64> = self.share_dedup_ids.keys()
+            .copied()
+            .filter(|&r| r < round_id)
+            .collect();
+        for old_round in stale_dedup_rounds {
+            if let Err(e) = self.cleanup_old_dedup(old_round).await {
+                warn!("ShareDedup cleanup for round {} failed (will retry): {}", old_round, e);
+            }
+        }
+
         let mut unique_templates: Vec<String> =
             batch.iter().map(|(t, _)| t.clone()).collect();
         unique_templates.sort();
@@ -2015,6 +2029,95 @@ impl MinerClient {
         self.share_dedup_ids.insert(round_id, id);
         info!("Created ShareDedup for round {}: {}", round_id, id);
         self.save_state();
+        Ok(())
+    }
+
+    /// Reclaim the storage rebate from a ShareDedup whose round has closed.
+    ///
+    /// One PTB chains `close_share_dedup(dedup, [hashes…])` (drains the
+    /// dedup's dynamic-field hash entries) followed by
+    /// `delete_share_dedup(dedup)` (deletes the now-empty object). Hashes
+    /// come from `get_dynamic_fields` on the dedup itself, not from event
+    /// queries — this stays correct across package upgrades where the
+    /// event-type ID drifts from the published-at ID. Move's PTB
+    /// borrow-checker permits the same input object to be borrowed by
+    /// `&mut` (close) then consumed by value (delete) within one tx.
+    ///
+    /// Caller responsibility: only invoke for rounds < `pool.current_round`.
+    /// The dedup is rebate-safe to delete the moment the round has advanced
+    /// — `submit_share` against any new Template would carry a different
+    /// `round_id` and abort before touching this dedup. Best-effort: errors
+    /// are returned for the caller to log; the cache entry is left in place
+    /// so the next flush retries.
+    async fn cleanup_old_dedup(&mut self, round_id: u64) -> Result<()> {
+        let dedup_id = match self.share_dedup_ids.get(&round_id).copied() {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        // 1. Page through all share-hash dynamic fields on this ShareDedup.
+        let mut hashes: Vec<Vec<u8>> = Vec::new();
+        let mut cursor: Option<ObjectID> = None;
+        loop {
+            let page = self.client.read_api()
+                .get_dynamic_fields(dedup_id, cursor, Some(50))
+                .await
+                .map_err(|e| anyhow!("get_dynamic_fields {}: {}", dedup_id, e))?;
+            for info in &page.data {
+                if let Some(arr) = info.name.value.as_array() {
+                    let h: Vec<u8> = arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect();
+                    if !h.is_empty() {
+                        hashes.push(h);
+                    }
+                }
+            }
+            if !page.has_next_page { break; }
+            cursor = page.next_cursor;
+        }
+
+        // 2. Build the cleanup PTB: close (if any hashes) then delete.
+        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let dedup_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+            .map_err(|e| anyhow!("cleanup dedup arg: {}", e))?;
+
+        if !hashes.is_empty() {
+            let hashes_arg = ptb.pure(&hashes)
+                .map_err(|e| anyhow!("cleanup hashes arg: {}", e))?;
+            ptb.programmable_move_call(
+                self.package_id,
+                ident("share_dedup"),
+                ident("close_share_dedup"),
+                vec![],
+                vec![dedup_arg, hashes_arg],
+            );
+        }
+
+        ptb.programmable_move_call(
+            self.package_id,
+            ident("share_dedup"),
+            ident("delete_share_dedup"),
+            vec![],
+            vec![dedup_arg],
+        );
+
+        let resp = self.exec(ptb.finish()).await?;
+        if let Some(eff) = &resp.effects {
+            use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
+            if let SuiExecutionStatus::Failure { error } = eff.status() {
+                return Err(anyhow!("cleanup aborted on chain: {}", error));
+            }
+        }
+
+        self.update_from_resp(&resp);
+        self.share_dedup_ids.remove(&round_id);
+        self.save_state();
+        info!(
+            "Reclaimed ShareDedup for closed round {} ({}): drained {} hash(es)",
+            round_id, dedup_id, hashes.len()
+        );
         Ok(())
     }
 
