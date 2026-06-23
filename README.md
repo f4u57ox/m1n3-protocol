@@ -9,7 +9,7 @@ The BTC reward address is a deterministic function of a Sui object's UID —
 nobody chooses it, not even the operator.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Sui Network](https://img.shields.io/badge/Sui-mainnet-4DA2FF.svg)](https://suiscan.xyz/mainnet/object/0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2)
+[![Sui Network](https://img.shields.io/badge/Sui-mainnet-4DA2FF.svg)](https://suiscan.xyz/mainnet/object/0x640abaf8a19cc75d0118046e3c1a2528c2017adf9823e6ca505c5dd31a588b77)
 [![Move package](https://img.shields.io/badge/package-m1n3__v4-orange.svg)](contracts/Published.toml)
 [![Sui Overflow 2026](https://img.shields.io/badge/Sui_Overflow-2026_·_DeFi_%26_Payments-9333ea.svg)](https://mystenlabs.notion.site/defi-payments-problem-statement)
 
@@ -137,17 +137,26 @@ For a single-rig solo setup the minimum viable bundle is: one bitcoind + one str
 
 ## What's deployed
 
-### Mainnet — live today
+### Mainnet — live today (v5)
 
 | Object | ID |
 |---|---|
-| `m1n3_v4` package | [`0x2b259838…b771f9fea2`](https://suiscan.xyz/mainnet/object/0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2) |
-| `Pool` shared object | [`0x7ca199ca…1e2bd73ba`](https://suiscan.xyz/mainnet/object/0x7ca199ca3fa3e107de9832f7b44b905154883fe3f617a420bf6cf4d1e2bd73ba) |
-| `MarketFeePool<USDC>` | [`0x9464795f…e99257e86`](https://suiscan.xyz/mainnet/object/0x9464795f5382c2336cd45de0f30185006a52c3a49df25c6fae7c39de99257e86) |
-| `HashShareRegistry` | [`0xffb857cf…48a532fb2`](https://suiscan.xyz/mainnet/object/0xffb857cfc50f8ba9bd9a0e67f22692f1162d8e137af4314f260963048a532fb2) |
-| `MinerRoundRegistry` | [`0xd887ce8a…f4cb37c84`](https://suiscan.xyz/mainnet/object/0xd887ce8a9b3ad2af7f4088ed7fa55b813b0c94f6ead2178c0379586f4cb37c84) |
-| `ProtocolMPCConfig` | [`0x84b1da14…686d472a48`](https://suiscan.xyz/mainnet/object/0x84b1da14bced4916a39c4a6047d0beac5b19df3f681faef62c13e2686d472a48) |
-| `HashiRewardRegistry` *(deployed but inert until Hashi mainnet)* | [`0x386970ab…6b8ea215a`](https://suiscan.xyz/mainnet/object/0x386970ab35d41761a3763284ec6d4b3fe9c921c622c31631262a9fd6b8ea215a) |
+| `m1n3_v4` package (v5) | [`0x640abaf8…31a588b77`](https://suiscan.xyz/mainnet/object/0x640abaf8a19cc75d0118046e3c1a2528c2017adf9823e6ca505c5dd31a588b77) |
+| `Pool` shared object | [`0x545372ea…d8fbe4d`](https://suiscan.xyz/mainnet/object/0x545372ea919c555adbc14e7b43fa3bcc6bc0e1000c32c3dd71793dfbbd8fbe4d) |
+| `ShareDedupRegistry` *(now per-round)* | [`0x495732f0…2afa591`](https://suiscan.xyz/mainnet/object/0x495732f08be35285d961a1eb622e72f870f0e2055b68dc63cf4ca14ff2afa591) |
+| `HashShareRegistry` | [`0x92d4eaa3…9f32f363`](https://suiscan.xyz/mainnet/object/0x92d4eaa3f92addac3e030d413b206ed5f1a74cc141ea6b6a8d4eeadc9f32f363) |
+| `MinerRoundRegistry` | [`0x888c9616…be20a0e9a`](https://suiscan.xyz/mainnet/object/0x888c96164c2ed5618e2bc5b2ce3630ed22d471c762c73e1ddc09280be20a0e9a) |
+| `M1N3Treasury` | [`0x0c93157a…5dccbe94`](https://suiscan.xyz/mainnet/object/0x0c93157a754bffb9bfc18f1bbea3ce310a84577886f77158ca8bc0915dccbe94) |
+| `HashiRewardRegistry` *(deployed but inert until Hashi mainnet)* | [`0x99573a5e…2b890496c`](https://suiscan.xyz/mainnet/object/0x99573a5e0ee7b1986c37801262a3fd881ac79aa9460236cae343a0c2b890496c) |
+| `UpgradeCap` | [`0xe4b7c916…933a0c70c`](https://suiscan.xyz/mainnet/object/0xe4b7c9160a3d23b62bcb29c747605d8f134735de6815a2bc6015a25933a0c70c) |
+
+**v5 changes vs v4:**
+
+- `share_dedup` now scoped per `(miner, round_id)` — one ShareDedup per round per miner instead of per template, ~14× reduction in per-share bootstrap txs.
+- `DerivedTemplate.round_id` field — inherited from parent at derivation so the buyer-pay lane shares the same dedup scoping.
+- `MAX_MERKLE_BRANCHES = 64` cap in `register_template_inner` — prevents 0.01-SUI-griefing attack via unbounded merkle branches.
+
+v4 (`0x2b259838…`) was orphaned by this publish — the dedup-key schema change blocked an in-place upgrade. Existing v4 owned objects can still be `close_share_dedup`'d / `close_miner_round_stats`'d for storage rebate by their original owners.
 
 **Live on mainnet:**
 

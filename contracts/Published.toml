@@ -4,12 +4,20 @@
 
 [published.mainnet]
 chain-id = "35834a8a"
-published-at = "0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2"
-original-id = "0x9a5e441ab67702541e490e3f208faacb13c20e2a855f7304906f7faac2012761"
-version = 4
-toolchain-version = "1.73.1"
+published-at = "0x640abaf8a19cc75d0118046e3c1a2528c2017adf9823e6ca505c5dd31a588b77"
+original-id = "0x640abaf8a19cc75d0118046e3c1a2528c2017adf9823e6ca505c5dd31a588b77"
+version = 1
+toolchain-version = "1.68.0"
 build-config = { flavor = "sui", edition = "2024" }
-upgrade-capability = "0xd82041155050d615b1e814774a0aed8d31bed881d5cb4c65038ca6714a7043d3"
+upgrade-capability = "0xe4b7c9160a3d23b62bcb29c747605d8f134735de6815a2bc6015a25933a0c70c"
+
+# v4 publication retained for historical reference. Orphaned by v5 — the
+# share_dedup schema (ShareDedupKey, ShareDedup.template_id → round_id) and
+# DerivedTemplate.round_id field made an in-place upgrade impossible, so v5
+# is a fresh publish with new shared objects. v4 was at
+# published-at = 0x2b2598383b25dd0c9d052e32a8a3ccbbb1a9236cd875212c7dd394b771f9fea2
+# original-id = 0x9a5e441ab67702541e490e3f208faacb13c20e2a855f7304906f7faac2012761
+# upgrade-capability = 0xd82041155050d615b1e814774a0aed8d31bed881d5cb4c65038ca6714a7043d3
 
 [published.testnet]
 chain-id = "4c78adac"
