@@ -72,6 +72,15 @@ module m1n3_v4::pool {
     /// per day) pays ~$7/day. The operator's PoolAdminCap path bypasses
     /// this fee entirely (`register_template`).
     const PERMISSIONLESS_TEMPLATE_FEE_MIST: u64 = 10_000_000;
+    /// Hard cap on `Template.merkle_branches.length`. Bitcoin's merkle tree
+    /// has depth ceil(log2(N_tx)); a block with 2^32 transactions would have
+    /// 32 branches, and Bitcoin's protocol-level tx-count limit is far lower.
+    /// 64 gives a generous safety margin while bounding the per-share gas
+    /// cost of `submit_share`'s merkle-root recomputation loop — without
+    /// this cap, a single `register_template_public` call (0.01 SUI) can
+    /// publish a template with millions of fake branches, forcing every
+    /// miner that hashes against it to pay unbounded SHA256d gas.
+    const MAX_MERKLE_BRANCHES: u64 = 64;
 
     // ── Error codes ───────────────────────────────────────────────────────────
 
@@ -107,6 +116,8 @@ module m1n3_v4::pool {
     const EHashpowerOrderExpired: vector<u8> = b"HashpowerBuyOrder.expires_epoch has passed; the order cannot accept new shares";
     #[error]
     const EZeroPrice: vector<u8> = b"HashpowerBuyOrder price_per_difficulty must be > 0";
+    #[error]
+    const EInvalidMerkleTree: vector<u8> = b"Template.merkle_branches.length exceeds MAX_MERKLE_BRANCHES";
     #[error]
     const EOrderNotDynamic: vector<u8> = b"HashpowerBuyOrder.is_dynamic == false; the buyer committed to a fixed price at creation";
     #[error]
@@ -414,6 +425,14 @@ module m1n3_v4::pool {
         ntime: u32,
         ctx: &mut TxContext,
     ) {
+        // Bound merkle depth — `submit_share` walks every branch in a
+        // SHA256d loop, and `register_template_public` is permissionless,
+        // so without this an attacker spending 0.01 SUI can publish a
+        // template that forces every miner who hashes it to pay
+        // unbounded gas. DerivedTemplate inherits `parent.merkle_branches`
+        // so the bound carries through to the buyer-pay lane too.
+        assert!(vector::length(&merkle_branches) <= MAX_MERKLE_BRANCHES, EInvalidMerkleTree);
+
         let now = clock::timestamp_ms(clock);
         let round_id = pool.current_round;
         let min_difficulty = pool.global_min_difficulty;

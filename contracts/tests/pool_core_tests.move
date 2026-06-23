@@ -145,6 +145,80 @@ module m1n3_v4::pool_core_tests {
     }
 
     #[test]
+    #[expected_failure(abort_code = m1n3_v4::pool::EInvalidMerkleTree)]
+    fun register_template_rejects_oversized_merkle_branches() {
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let cap = ts::take_from_sender<PoolAdminCap>(&sc);
+            let mut pool_obj = ts::take_shared<Pool>(&sc);
+            let mut clk = clock::create_for_testing(ts::ctx(&mut sc));
+            clock::set_for_testing(&mut clk, T0);
+
+            // Build a 65-branch vector — one over MAX_MERKLE_BRANCHES (64).
+            // Each branch is a placeholder 32-byte vector; the assert fires
+            // before any sha256d work happens, so contents don't matter.
+            let mut branches: vector<vector<u8>> = vector::empty();
+            let mut i = 0u64;
+            while (i < 65) {
+                vector::push_back(&mut branches, b"00000000000000000000000000000000");
+                i = i + 1;
+            };
+
+            pool::register_template(
+                &mut pool_obj, &cap, &clk,
+                HEIGHT_850K, prev_hash(),
+                b"cb1", b"cb2",
+                branches,
+                VERSION, NBITS_REGTEST, NTIME,
+                ts::ctx(&mut sc),
+            );
+
+            clock::destroy_for_testing(clk);
+            ts::return_to_sender(&sc, cap);
+            ts::return_shared(pool_obj);
+        };
+        ts::end(sc);
+    }
+
+    #[test]
+    fun register_template_accepts_max_merkle_branches() {
+        // Exactly 64 branches should be accepted. Sanity check that the
+        // boundary isn't off-by-one.
+        let mut sc = ts::begin(ADMIN);
+        setup(&mut sc);
+        ts::next_tx(&mut sc, ADMIN);
+        {
+            let cap = ts::take_from_sender<PoolAdminCap>(&sc);
+            let mut pool_obj = ts::take_shared<Pool>(&sc);
+            let mut clk = clock::create_for_testing(ts::ctx(&mut sc));
+            clock::set_for_testing(&mut clk, T0);
+
+            let mut branches: vector<vector<u8>> = vector::empty();
+            let mut i = 0u64;
+            while (i < 64) {
+                vector::push_back(&mut branches, b"00000000000000000000000000000000");
+                i = i + 1;
+            };
+
+            pool::register_template(
+                &mut pool_obj, &cap, &clk,
+                HEIGHT_850K, prev_hash(),
+                b"cb1", b"cb2",
+                branches,
+                VERSION, NBITS_REGTEST, NTIME,
+                ts::ctx(&mut sc),
+            );
+
+            clock::destroy_for_testing(clk);
+            ts::return_to_sender(&sc, cap);
+            ts::return_shared(pool_obj);
+        };
+        ts::end(sc);
+    }
+
+    #[test]
     fun register_template_requires_admin_cap() {
         // Positive path — just verify it succeeds with the correct cap.
         let mut sc = ts::begin(ADMIN);
