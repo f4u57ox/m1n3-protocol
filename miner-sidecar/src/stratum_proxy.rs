@@ -204,16 +204,6 @@ async fn batch_flusher(
     let mut ticker = interval(Duration::from_millis(batch_timeout_ms));
     ticker.tick().await; // consume the immediate first tick
 
-    // Periodic ShareDedup cleanup tick. One dedup per fire to bound
-    // latency in the share hot-path; the crank loops until eligible
-    // round count drops to zero across subsequent ticks. 5-minute
-    // cadence is a good middle ground: rounds finalise on block-find
-    // intervals which average ~10 minutes on mainnet, so we usually
-    // catch each round's dedup within one or two ticks of it closing
-    // without spamming PTBs.
-    let mut cleanup_ticker = interval(Duration::from_secs(300));
-    cleanup_ticker.tick().await;
-
     loop {
         tokio::select! {
             cfg = cfg_rx.recv() => {
@@ -240,18 +230,6 @@ async fn batch_flusher(
                 }
             }
             _ = ticker.tick() => flush(&mut sender, &mut batch).await,
-            _ = cleanup_ticker.tick() => {
-                match sender.crank_share_dedup_cleanup().await {
-                    Ok(Some((round, dedup_id))) => {
-                        info!(
-                            "Cleaned up ShareDedup for round {} ({}) — storage rebate reclaimed",
-                            round, dedup_id
-                        );
-                    }
-                    Ok(None) => {} // nothing eligible, fine
-                    Err(e) => warn!("ShareDedup cleanup tick errored: {}", e),
-                }
-            }
         }
     }
 }
