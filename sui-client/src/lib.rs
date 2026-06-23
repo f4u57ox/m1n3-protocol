@@ -698,20 +698,6 @@ impl MinerClient {
         self.ensure_round_stats(round_id).await?;
         self.ensure_share_dedup(round_id).await?;
 
-        // 2. Opportunistic cleanup of ShareDedups from closed rounds. Cheap
-        //    (~1 PTB per dedup, paid in storage rebate not gas), best-effort:
-        //    a failure here doesn't abort the share batch — the cache entry
-        //    is left in place so the next flush retries.
-        let stale_dedup_rounds: Vec<u64> = self.share_dedup_ids.keys()
-            .copied()
-            .filter(|&r| r < round_id)
-            .collect();
-        for old_round in stale_dedup_rounds {
-            if let Err(e) = self.cleanup_old_dedup(old_round).await {
-                warn!("ShareDedup cleanup for round {} failed (will retry): {}", old_round, e);
-            }
-        }
-
         let mut unique_templates: Vec<String> =
             batch.iter().map(|(t, _)| t.clone()).collect();
         unique_templates.sort();
@@ -1882,6 +1868,150 @@ impl MinerClient {
     /// Delete a MinerRoundStats object to reclaim its storage rebate.
     /// Only safe to call after the round's work has been accumulated (MinerWorkAccumulated
     /// event is the permanent on-chain record that replaces the object).
+    // ── Storage-rebate reclamation: ShareDedup cleanup ────────────────────────
+    //
+    // After a round finalises, the per-(miner, round) ShareDedup object is
+    // "dead weight" — no more submit_shares can reference it, but it still
+    // costs storage rent until close + delete are called. Sui's input-
+    // resolution requires the owner to be the caller for both ops:
+    //
+    //   close_share_dedup(dedup: &mut ShareDedup, ...)
+    //   delete_share_dedup(dedup: ShareDedup, ...)
+    //
+    // So true "anyone-can-call" permissionless cranking by an arbitrary
+    // keeper isn't possible without converting ShareDedup to a shared
+    // object — which would force every `record_share` through Sui consensus
+    // and kill the owned-object fast path that's the whole protocol story.
+    //
+    // The practical equivalent is the same outcome (rebate gets reclaimed)
+    // driven by the sidecar itself: the sidecar owns its own ShareDedups
+    // and is already long-running, so it can crank cleanup for any round
+    // strictly older than `pool.current_round`.
+    //
+    // This method does one dedup per call to bound latency in the share
+    // hot-path; the sidecar's batch_flusher calls it on a periodic
+    // ticker. Returns the (round, dedup_id) cleaned, or None if nothing
+    // is eligible.
+
+    /// Drain hash dynamic fields then delete the oldest ShareDedup whose
+    /// round has finalised. Idempotent + no-op when nothing is eligible.
+    pub async fn crank_share_dedup_cleanup(&mut self) -> Result<Option<(u64, ObjectID)>> {
+        self.fetch_pool_round().await?;
+        let current = self.pool_round;
+        let target = self
+            .share_dedup_ids
+            .iter()
+            .filter(|(round, _)| **round < current)
+            .map(|(round, id)| (*round, *id))
+            .min_by_key(|(round, _)| *round);
+        let Some((round, dedup_id)) = target else {
+            return Ok(None);
+        };
+        info!(
+            "Cranking ShareDedup cleanup for round {} (dedup {})",
+            round, dedup_id
+        );
+        // Drain hashes in chunks until empty.
+        const CHUNK: usize = 50;
+        loop {
+            let hashes = self.fetch_dedup_field_keys(dedup_id, CHUNK).await?;
+            if hashes.is_empty() {
+                break;
+            }
+            self.close_share_dedup_with(dedup_id, hashes).await?;
+        }
+        self.delete_share_dedup_call(dedup_id).await?;
+        self.share_dedup_ids.remove(&round);
+        self.obj_vers.remove(&dedup_id);
+        self.save_state();
+        info!(
+            "ShareDedup round {} ({}) deleted — storage rebate reclaimed",
+            round, dedup_id
+        );
+        Ok(Some((round, dedup_id)))
+    }
+
+    async fn fetch_dedup_field_keys(
+        &self,
+        dedup_id: ObjectID,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let page = self
+            .client
+            .read_api()
+            .get_dynamic_fields(dedup_id, None, Some(limit))
+            .await
+            .map_err(|e| anyhow!("get_dynamic_fields {}: {}", dedup_id, e))?;
+        let mut keys = Vec::new();
+        for info in &page.data {
+            let json = serde_json::to_value(&info.name).unwrap_or_default();
+            let value = &json["value"];
+            // ShareDedup keys are vector<u8> (the 32-byte sha256d hash).
+            // The RPC encodes them as either a JSON array of u8 or a hex
+            // string with optional 0x prefix — handle both.
+            if let Some(arr) = value.as_array() {
+                let bytes: Option<Vec<u8>> = arr
+                    .iter()
+                    .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+                    .collect();
+                if let Some(b) = bytes {
+                    keys.push(b);
+                    continue;
+                }
+            }
+            if let Some(s) = value.as_str() {
+                let stripped = s.strip_prefix("0x").unwrap_or(s);
+                if let Ok(b) = decode_hex(stripped) {
+                    keys.push(b);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    async fn close_share_dedup_with(
+        &mut self,
+        dedup_id: ObjectID,
+        hashes: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let count = hashes.len();
+        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let dedup_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+            .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
+        let hashes_arg = ptb.pure(hashes).map_err(|e| anyhow!("{}", e))?;
+        ptb.programmable_move_call(
+            self.package_id,
+            ident("share_dedup"),
+            ident("close_share_dedup"),
+            vec![],
+            vec![dedup_arg, hashes_arg],
+        );
+        let resp = self.exec(ptb.finish()).await?;
+        self.update_from_resp(&resp);
+        info!("Drained {} hash(es) from ShareDedup {}", count, dedup_id);
+        Ok(())
+    }
+
+    async fn delete_share_dedup_call(&mut self, dedup_id: ObjectID) -> Result<()> {
+        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let dedup_arg = ptb
+            .obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
+            .map_err(|e| anyhow!("share_dedup arg: {}", e))?;
+        ptb.programmable_move_call(
+            self.package_id,
+            ident("share_dedup"),
+            ident("delete_share_dedup"),
+            vec![],
+            vec![dedup_arg],
+        );
+        let resp = self.exec(ptb.finish()).await?;
+        self.update_from_resp(&resp);
+        Ok(())
+    }
+
     async fn close_mrs(&mut self, mrs_id: ObjectID) -> Result<()> {
         let (mrs_ver, mrs_dig) = self.get_ver(mrs_id).await?;
         let mut ptb = ProgrammableTransactionBuilder::new();
@@ -2029,95 +2159,6 @@ impl MinerClient {
         self.share_dedup_ids.insert(round_id, id);
         info!("Created ShareDedup for round {}: {}", round_id, id);
         self.save_state();
-        Ok(())
-    }
-
-    /// Reclaim the storage rebate from a ShareDedup whose round has closed.
-    ///
-    /// One PTB chains `close_share_dedup(dedup, [hashes…])` (drains the
-    /// dedup's dynamic-field hash entries) followed by
-    /// `delete_share_dedup(dedup)` (deletes the now-empty object). Hashes
-    /// come from `get_dynamic_fields` on the dedup itself, not from event
-    /// queries — this stays correct across package upgrades where the
-    /// event-type ID drifts from the published-at ID. Move's PTB
-    /// borrow-checker permits the same input object to be borrowed by
-    /// `&mut` (close) then consumed by value (delete) within one tx.
-    ///
-    /// Caller responsibility: only invoke for rounds < `pool.current_round`.
-    /// The dedup is rebate-safe to delete the moment the round has advanced
-    /// — `submit_share` against any new Template would carry a different
-    /// `round_id` and abort before touching this dedup. Best-effort: errors
-    /// are returned for the caller to log; the cache entry is left in place
-    /// so the next flush retries.
-    async fn cleanup_old_dedup(&mut self, round_id: u64) -> Result<()> {
-        let dedup_id = match self.share_dedup_ids.get(&round_id).copied() {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-
-        // 1. Page through all share-hash dynamic fields on this ShareDedup.
-        let mut hashes: Vec<Vec<u8>> = Vec::new();
-        let mut cursor: Option<ObjectID> = None;
-        loop {
-            let page = self.client.read_api()
-                .get_dynamic_fields(dedup_id, cursor, Some(50))
-                .await
-                .map_err(|e| anyhow!("get_dynamic_fields {}: {}", dedup_id, e))?;
-            for info in &page.data {
-                if let Some(arr) = info.name.value.as_array() {
-                    let h: Vec<u8> = arr.iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as u8))
-                        .collect();
-                    if !h.is_empty() {
-                        hashes.push(h);
-                    }
-                }
-            }
-            if !page.has_next_page { break; }
-            cursor = page.next_cursor;
-        }
-
-        // 2. Build the cleanup PTB: close (if any hashes) then delete.
-        let (d_ver, d_dig) = self.get_ver(dedup_id).await?;
-        let mut ptb = ProgrammableTransactionBuilder::new();
-        let dedup_arg = ptb.obj(ObjectArg::ImmOrOwnedObject((dedup_id, d_ver, d_dig)))
-            .map_err(|e| anyhow!("cleanup dedup arg: {}", e))?;
-
-        if !hashes.is_empty() {
-            let hashes_arg = ptb.pure(&hashes)
-                .map_err(|e| anyhow!("cleanup hashes arg: {}", e))?;
-            ptb.programmable_move_call(
-                self.package_id,
-                ident("share_dedup"),
-                ident("close_share_dedup"),
-                vec![],
-                vec![dedup_arg, hashes_arg],
-            );
-        }
-
-        ptb.programmable_move_call(
-            self.package_id,
-            ident("share_dedup"),
-            ident("delete_share_dedup"),
-            vec![],
-            vec![dedup_arg],
-        );
-
-        let resp = self.exec(ptb.finish()).await?;
-        if let Some(eff) = &resp.effects {
-            use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
-            if let SuiExecutionStatus::Failure { error } = eff.status() {
-                return Err(anyhow!("cleanup aborted on chain: {}", error));
-            }
-        }
-
-        self.update_from_resp(&resp);
-        self.share_dedup_ids.remove(&round_id);
-        self.save_state();
-        info!(
-            "Reclaimed ShareDedup for closed round {} ({}): drained {} hash(es)",
-            round_id, dedup_id, hashes.len()
-        );
         Ok(())
     }
 
@@ -2402,6 +2443,29 @@ fn parse_object_ids(msg: &str) -> Vec<ObjectID> {
         }
     }
     out
+}
+
+/// Minimal hex decoder used by `fetch_dedup_field_keys` to accept the
+/// hex-encoded form that some Sui RPC versions return for `vector<u8>`
+/// dynamic-field keys. Even-length, lowercase or uppercase, no prefix.
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return Err(anyhow!("odd-length hex"));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("non-hex char"))? as u8;
+        let lo = (b[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("non-hex char"))? as u8;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
 }
 
 // ── Shared standalone helpers ─────────────────────────────────────────────────
