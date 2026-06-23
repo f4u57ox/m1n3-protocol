@@ -997,8 +997,12 @@ function PrivateMarketSection({
         </label>
       </div>
 
-      {/* Orders list — card layout on mobile, table grid on md+ */}
-      <div className="overflow-hidden rounded-2xl border border-border bg-card/60 backdrop-blur">
+      {/* Orders list — card layout on mobile, table grid on md+
+          NB: `overflow-hidden` is gated to md+ so the per-row template
+          detail (TemplateCard) can render its full-width header strip
+          / coinbase hex / merkle viz on mobile without silently clipping
+          beyond the rounded container. Desktop keeps the clean clip. */}
+      <div className="rounded-2xl border border-border bg-card/60 backdrop-blur md:overflow-hidden">
         {/* Column headers visible only on md+ (matches the order row's md grid) */}
         <div className="hidden md:grid md:grid-cols-[1fr_minmax(110px,auto)_minmax(110px,auto)_minmax(80px,auto)_minmax(160px,auto)] md:gap-2 md:border-b md:border-border/60 md:px-4 md:py-3 md:font-mono md:text-[10px] md:uppercase md:tracking-[0.25em] md:text-muted-foreground">
           <span>Buyer · template</span>
@@ -1213,8 +1217,16 @@ function PrivateOrderRow({
       <OrderActivityFooter order={order} quote={quote} />
 
       {showTpl && tplId && (
-        <div className="mt-3">
-          <PrivateOrderTemplate order={order} tplId={tplId} />
+        // -mx-4 cancels the `<li>`'s px-4 so the template card spans the
+        // full row width on mobile (where horizontal real estate is most
+        // constrained). overflow-x-auto is the safety net: if the inner
+        // TemplateCard renders anything wider than the row it becomes
+        // scrollable instead of being clipped. Desktop keeps the original
+        // inline layout.
+        <div className="mt-3 -mx-4 overflow-x-auto md:mx-0 md:overflow-visible">
+          <div className="min-w-0 px-4 md:px-0">
+            <PrivateOrderTemplate order={order} tplId={tplId} />
+          </div>
         </div>
       )}
 

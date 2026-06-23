@@ -73,8 +73,13 @@ export function TemplateCard({ template: t }: TemplateCardProps) {
             {/* Byte-proportional strip. Widths are the actual byte-ratios of
                 the 80-byte block header: 4/80, 32/80, 32/80, 4/80, 4/80, 4/80
                 = 5/40/40/5/5/5 (sums to 100%). Each cell shows just the short
-                form (8-char hex / 64-char hex); long-form values live below. */}
-            <div className="flex border rounded divide-x text-center text-[10px] overflow-hidden bg-muted/20">
+                form (8-char hex / 64-char hex); long-form values live below.
+                On mobile (<sm) the 5%-cells collapse to ~17px so the strip
+                stacks into a 2-col grid; from sm+ we use the byte-proportional
+                flex strip as designed. `HeaderSeg` falls back from its inline
+                `style.width` because Tailwind's `sm:` flex classes win at
+                that breakpoint. */}
+            <div className="grid grid-cols-2 gap-1 bg-muted/20 sm:flex sm:gap-0 sm:divide-x sm:rounded sm:border sm:overflow-hidden text-center text-[10px]">
               <HeaderSeg
                 widthPct={5}
                 title="Version"
@@ -379,10 +384,14 @@ function HeaderSeg({
   italicMuted?: boolean;
   allowWrap?: boolean;
 }) {
+  // CSS custom property holds the byte-ratio width so the inline percent
+  // applies only when the parent is a flex container (sm: breakpoint).
+  // On mobile the parent is `grid grid-cols-2`, ignoring `flex-basis`, and
+  // each cell occupies one grid column.
   return (
     <div
-      className="py-2 px-1.5 flex flex-col items-center justify-between min-w-0"
-      style={{ width: `${widthPct}%`, flex: `0 0 ${widthPct}%` }}
+      className="py-2 px-1.5 flex flex-col items-center justify-between min-w-0 rounded border sm:rounded-none sm:border-0 sm:[width:var(--seg-w)] sm:[flex:0_0_var(--seg-w)]"
+      style={{ ['--seg-w' as string]: `${widthPct}%` }}
     >
       <Tooltip>
         <TooltipTrigger asChild>
