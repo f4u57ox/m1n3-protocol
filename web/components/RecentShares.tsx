@@ -3,7 +3,17 @@
 import React from "react";
 import { useRecentShares } from "@/hooks/useRecentShares";
 import { formatDifficulty, solscanTx, solscanAccount } from "@/lib/utils";
-import { Zap, Box, ExternalLink, FileText } from "lucide-react";
+import { Zap, Box, ExternalLink, FileText, DollarSign } from "lucide-react";
+
+/** Format µUSDC (6 decimals) as a compact USDC string. */
+function formatPayoutUsdc(microUsdc: number): string {
+  const usdc = microUsdc / 1_000_000;
+  if (usdc >= 1) return `$${usdc.toFixed(2)}`;
+  if (usdc >= 0.01) return `$${usdc.toFixed(4)}`;
+  // Sub-cent — show with the full µUSDC precision so per-share payouts at
+  // price_per_difficulty=1 (~1 µUSDC per diff-1 unit) stay readable.
+  return `$${usdc.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}`;
+}
 
 function shortenAddress(addr: string): string {
   if (addr.length <= 12) return addr;
@@ -51,6 +61,7 @@ export const RecentShares = React.memo(function RecentShares() {
 
   const fullCount = shares.filter((s) => s.mode === "full").length;
   const lightweightCount = shares.filter((s) => s.mode === "lightweight").length;
+  const buyerCount = shares.filter((s) => s.mode === "buyer-v1" || s.mode === "buyer-v2").length;
 
   return (
     <div className="rounded-lg border bg-card p-4">
@@ -63,7 +74,13 @@ export const RecentShares = React.memo(function RecentShares() {
           {fullCount > 0 && (
             <span className="inline-flex items-center rounded-full px-2 py-0.5 bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
               <Box className="h-3 w-3 mr-1" />
-              {fullCount} NFT
+              {fullCount} Pool
+            </span>
+          )}
+          {buyerCount > 0 && (
+            <span className="inline-flex items-center rounded-full px-2 py-0.5 bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20">
+              <DollarSign className="h-3 w-3 mr-1" />
+              {buyerCount} Private
             </span>
           )}
           {lightweightCount > 0 && (
@@ -81,7 +98,22 @@ export const RecentShares = React.memo(function RecentShares() {
         </p>
       ) : (
         <div className="space-y-1 max-h-[400px] overflow-y-auto">
-          {shares.map((share, idx) => (
+          {shares.map((share, idx) => {
+            const isBuyer = share.mode === "buyer-v1" || share.mode === "buyer-v2";
+            const laneTitle =
+              share.mode === "lightweight"
+                ? "Lightweight (no NFT)"
+                : share.mode === "buyer-v1"
+                  ? "Buyer-pay V1 — template-pinned (paid in USDC)"
+                  : share.mode === "buyer-v2"
+                    ? "Buyer-pay V2 — buyer-bound (paid in USDC)"
+                    : "Pool lane — credits MinerRoundStats";
+            const laneClasses = isBuyer
+              ? "bg-purple-500/20 text-purple-600 dark:text-purple-400"
+              : share.mode === "lightweight"
+                ? "bg-green-500/20 text-green-600 dark:text-green-400"
+                : "bg-blue-500/20 text-blue-600 dark:text-blue-400";
+            return (
             <div
               key={`${share.txDigest}-${idx}`}
               className={`flex items-center justify-between py-1.5 px-2 rounded text-xs ${
@@ -92,14 +124,12 @@ export const RecentShares = React.memo(function RecentShares() {
             >
               <div className="flex items-center gap-2">
                 <span
-                  className={`inline-flex items-center justify-center w-5 h-5 rounded ${
-                    share.mode === "lightweight"
-                      ? "bg-green-500/20 text-green-600 dark:text-green-400"
-                      : "bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                  }`}
-                  title={share.mode === "lightweight" ? "Lightweight (no NFT)" : "Full (NFT minted)"}
+                  className={`inline-flex items-center justify-center w-5 h-5 rounded ${laneClasses}`}
+                  title={laneTitle}
                 >
-                  {share.mode === "lightweight" ? (
+                  {isBuyer ? (
+                    <DollarSign className="h-3 w-3" />
+                  ) : share.mode === "lightweight" ? (
                     <Zap className="h-3 w-3" />
                   ) : (
                     <Box className="h-3 w-3" />
@@ -115,6 +145,14 @@ export const RecentShares = React.memo(function RecentShares() {
                 )}
               </div>
               <div className="flex items-center gap-3">
+                {isBuyer && typeof share.payoutMicro === "number" && (
+                  <span
+                    className="text-purple-600 dark:text-purple-400 font-medium"
+                    title="USDC paid to the miner inside the share-submission PTB"
+                  >
+                    {formatPayoutUsdc(share.payoutMicro)}
+                  </span>
+                )}
                 <span className="text-muted-foreground">
                   diff: {formatDifficulty(share.difficultyAchieved)}
                 </span>
@@ -143,19 +181,20 @@ export const RecentShares = React.memo(function RecentShares() {
                 </a>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
       <div className="mt-3 pt-3 border-t text-xs text-muted-foreground">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <div className="flex items-center gap-1">
             <Box className="h-3 w-3 text-blue-500" />
-            <span>Full — minted as an object on Sui, tradeable on the marketplace</span>
+            <span>Pool — credits MinerRoundStats, paid in BTC at round close</span>
           </div>
           <div className="flex items-center gap-1">
-            <Zap className="h-3 w-3 text-green-500" />
-            <span>Lite — recorded as event only (no NFT), ~84% gas savings</span>
+            <DollarSign className="h-3 w-3 text-purple-500" />
+            <span>Private — buyer-pay, USDC paid atomically inside the share PTB</span>
           </div>
         </div>
       </div>

@@ -72,7 +72,7 @@ export interface DifficultyResetEvent {
   timestamp: number;
 }
 
-/** A share event (either ShareSubmitted or ShareValidated). */
+/** A share event from any of the three share-submission lanes. */
 export interface ShareEvent {
   miner: string;
   templateId: string;
@@ -83,8 +83,20 @@ export interface ShareEvent {
   timestampMs: number;
   txDigest: string;
   roundId?: number;
-  /** 'full' for ShareSubmitted (NFT created), 'lightweight' for ShareValidated */
-  mode: 'full' | 'lightweight';
+  /**
+   * Lane / mint mode:
+   *   'full'        — pool lane (`ShareSubmitted` from `submit_share`); credits MinerRoundStats.
+   *   'lightweight' — legacy (pre-cleanup `ShareValidated`); kept for back-compat.
+   *   'buyer-v1'    — V1 buyer-pay (`HashpowerShareFilled` from `submit_share_for_pay`).
+   *   'buyer-v2'    — V2 buyer-bound (`BuyerHashpowerShareFilled` from `submit_share_for_buyer_pay`).
+   */
+  mode: 'full' | 'lightweight' | 'buyer-v1' | 'buyer-v2';
+  /** Buyer-pay only — µQuote drained from the order into the miner's wallet. */
+  payoutMicro?: number;
+  /** Buyer-pay only — the on-chain HashpowerBuyOrder / BuyerHashpowerOrder that funded the share. */
+  orderId?: string;
+  /** Buyer-pay only — set when the share was hashed against a DerivedTemplate. */
+  derivedTemplateId?: string;
 }
 
 export interface ConnectionStatus {

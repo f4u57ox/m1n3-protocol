@@ -1,16 +1,32 @@
 /**
  * Recent share events via Sui GraphQL.
  *
- * The current contract emits a single share event type:
- *   pool::ShareSubmitted { miner, template_id, round_id, share_hash,
- *                         difficulty, is_block, timestamp_ms }
+ * Three share-event types feed the Recent Shares table, one per submission lane:
  *
- * Legacy ShareValidated/full vs lightweight is dropped — `submit_share`
- * always emits one ShareSubmitted, with no NFT minted on the hot path.
+ *   pool::ShareSubmitted              { miner, template_id, round_id, share_hash,
+ *                                       difficulty, is_block, timestamp_ms }
+ *       Emitted by `submit_share` — pool lane, credits MinerRoundStats.
+ *
+ *   pool::HashpowerShareFilled        { order_id, miner, template_id, derived_template_id,
+ *                                       difficulty, payout, is_block, timestamp_ms }
+ *       V1 buyer-pay lane (`submit_share_for_pay` / `submit_share_for_pay_derived`).
+ *       Miner is paid in QuoteT atomically; no pool-round accumulation.
+ *
+ *   pool::BuyerHashpowerShareFilled   { order_id, miner, template_id, derived_template_id,
+ *                                       difficulty, payout, is_block, timestamp_ms }
+ *       V2 buyer-bound lane (`submit_share_for_buyer_pay`). Same payout semantics
+ *       as V1; the order binds to the buyer's address rather than a single template.
+ *
+ * All three are merged here and exposed via a single `ShareEvent[]`.
  */
 
 import { gql, parseU64 } from './sui-graphql';
-import { ORIGINAL_PACKAGE_ID, PACKAGE_ID } from './constants';
+import {
+  ORIGINAL_PACKAGE_ID,
+  PACKAGE_ID,
+  HASHPOWER_LANE_PACKAGE_ID,
+  HASHPOWER_LANE_V2_PACKAGE_ID,
+} from './constants';
 import type { ShareEvent } from './types';
 
 interface GqlShareNode {
@@ -44,13 +60,28 @@ function shareHashToHex(val: unknown): string {
 
 function nodeToShareEvent(
   node: GqlShareNode,
-  mode: 'full' | 'lightweight',
+  mode: ShareEvent['mode'],
 ): ShareEvent {
   const json = node.contents?.json ?? {};
   const shareHashHex = shareHashToHex(json.share_hash);
   // The new ShareSubmitted event renames `difficulty_achieved` → `difficulty`
   // and drops `target_difficulty`. Read both names for back-compat.
   const difficulty = parseU64(json.difficulty ?? json.difficulty_achieved ?? 0);
+
+  // Buyer-pay events carry `payout`, `order_id` and an Option<ID>
+  // `derived_template_id`. The Option encodes as `{ vec: [<ID>] }` or
+  // `{ vec: [] }` in GraphQL JSON depending on the SDK; tolerate both
+  // by accepting either shape.
+  const payout = parseU64(json.payout ?? 0);
+  const orderId = (json.order_id as string) ?? undefined;
+  let derivedTemplateId: string | undefined;
+  const dt = json.derived_template_id;
+  if (typeof dt === 'string') {
+    derivedTemplateId = dt;
+  } else if (dt && typeof dt === 'object' && Array.isArray(dt.vec) && dt.vec.length > 0) {
+    derivedTemplateId = String(dt.vec[0]);
+  }
+
   return {
     miner: (json.miner as string) ?? '',
     templateId: (json.template_id as string) ?? '',
@@ -62,6 +93,9 @@ function nodeToShareEvent(
     timestampMs: parseU64(json.timestamp_ms),
     txDigest: node.transaction?.digest ?? '',
     mode,
+    ...(payout > 0 ? { payoutMicro: payout } : {}),
+    ...(orderId ? { orderId } : {}),
+    ...(derivedTemplateId ? { derivedTemplateId } : {}),
   };
 }
 
@@ -75,42 +109,53 @@ export async function fetchRecentShares(limit = 20): Promise<ShareEvent[]> {
   try {
     if (!ORIGINAL_PACKAGE_ID) return [];
 
-    const packageIds = [ORIGINAL_PACKAGE_ID];
-    if (PACKAGE_ID && PACKAGE_ID !== ORIGINAL_PACKAGE_ID) {
-      packageIds.push(PACKAGE_ID);
-    }
+    // Pool-lane (`ShareSubmitted`) packages: the original + the upgraded
+    // published-at if they diverge (an upgrade keeps event types bound to the
+    // original id). On a fresh publish like v5, both are the same value.
+    const poolPackageIds = Array.from(new Set([
+      ORIGINAL_PACKAGE_ID,
+      ...(PACKAGE_ID && PACKAGE_ID !== ORIGINAL_PACKAGE_ID ? [PACKAGE_ID] : []),
+    ]));
+    // V1 buyer-pay lane (`HashpowerShareFilled`): origin id of the V1 struct.
+    // Falls back to the pool packages if not configured.
+    const v1LanePackageIds = Array.from(new Set(
+      HASHPOWER_LANE_PACKAGE_ID ? [HASHPOWER_LANE_PACKAGE_ID] : poolPackageIds,
+    ));
+    // V2 buyer-bound lane (`BuyerHashpowerShareFilled`): origin id of the V2 struct.
+    const v2LanePackageIds = Array.from(new Set(
+      HASHPOWER_LANE_V2_PACKAGE_ID ? [HASHPOWER_LANE_V2_PACKAGE_ID] : poolPackageIds,
+    ));
 
-    // Single event type now: pool::ShareSubmitted.
-    const fullResults = await Promise.all(
-      packageIds.map((pkgId) =>
-        gql<{ events: { nodes: GqlShareNode[] } }>(
-          EVENT_QUERY,
-          { type: `${pkgId}::pool::ShareSubmitted`, limit },
-        ).then((d) => d?.events?.nodes ?? []).catch(() => [] as GqlShareNode[])
-      ),
-    );
-    const liteResults: GqlShareNode[][] = [];
+    const queryEvent = (pkgId: string, name: string) =>
+      gql<{ events: { nodes: GqlShareNode[] } }>(
+        EVENT_QUERY,
+        { type: `${pkgId}::pool::${name}`, limit },
+      ).then((d) => d?.events?.nodes ?? []).catch(() => [] as GqlShareNode[]);
 
-    // Merge both event types, deduplicate by tx digest, sort newest-first
+    // Run all three lane queries (× all origin packages) in parallel.
+    const [poolResults, v1Results, v2Results] = await Promise.all([
+      Promise.all(poolPackageIds.map((p) => queryEvent(p, 'ShareSubmitted'))),
+      Promise.all(v1LanePackageIds.map((p) => queryEvent(p, 'HashpowerShareFilled'))),
+      Promise.all(v2LanePackageIds.map((p) => queryEvent(p, 'BuyerHashpowerShareFilled'))),
+    ]);
+
+    // Merge into one stream, dedupe by tx digest, sort newest-first.
     const seen = new Set<string>();
-    const merged: (GqlShareNode & { _ts: number; _mode: 'full' | 'lightweight' })[] = [];
+    const merged: (GqlShareNode & { _ts: number; _mode: ShareEvent['mode'] })[] = [];
 
-    for (const nodes of fullResults) {
-      for (const n of nodes) {
-        const key = n.transaction?.digest ?? n.timestamp;
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        merged.push({ ...n, _ts: Date.parse(n.timestamp) || 0, _mode: 'full' });
+    const collect = (results: GqlShareNode[][], mode: ShareEvent['mode']) => {
+      for (const nodes of results) {
+        for (const n of nodes) {
+          const key = n.transaction?.digest ?? n.timestamp;
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          merged.push({ ...n, _ts: Date.parse(n.timestamp) || 0, _mode: mode });
+        }
       }
-    }
-    for (const nodes of liteResults) {
-      for (const n of nodes) {
-        const key = n.transaction?.digest ?? n.timestamp;
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        merged.push({ ...n, _ts: Date.parse(n.timestamp) || 0, _mode: 'lightweight' });
-      }
-    }
+    };
+    collect(poolResults, 'full');
+    collect(v1Results, 'buyer-v1');
+    collect(v2Results, 'buyer-v2');
 
     merged.sort((a, b) => b._ts - a._ts);
     return merged.slice(0, limit).map((n) => nodeToShareEvent(n, n._mode));
