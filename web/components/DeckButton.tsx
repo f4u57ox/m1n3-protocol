@@ -83,8 +83,16 @@ export function DeckButton({
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-sm sm:p-6"
           onClick={close}
         >
+          {/* Modal panel.
+              Width: capped at `max-w-5xl` (1024 px) so even on a 4K display
+              the deck doesn't sprawl edge-to-edge — readable line lengths
+              for any embedded body text.
+              Height: `max-h-[88vh]` leaves a visible band of backdrop top
+              and bottom so the modal reads as floating, not full-takeover.
+              On phones the inner `p-3` on the backdrop already inset-pads,
+              so this collapses to fill-available-after-inset. */}
           <div
-            className="relative h-full max-h-[92vh] w-full max-w-6xl overflow-hidden rounded-2xl border border-border bg-card shadow-2xl"
+            className="relative h-full max-h-[88vh] w-full max-w-5xl overflow-hidden rounded-2xl border border-border bg-card shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header strip with close + open-in-new-tab fallback. */}
@@ -109,9 +117,19 @@ export function DeckButton({
 
             {/* Native PDF viewer via `<iframe>` — works in every modern
                 browser without pulling pdfjs (~1 MB) into the bundle.
-                `#toolbar=1` hints to surface the browser's PDF toolbar. */}
+                URL fragment params (Adobe's PDF Open Parameters spec,
+                honored by Chrome / Firefox / Safari / Edge built-in viewers):
+                  - `view=Fit` scales the *entire* page to fit the iframe.
+                    Critical for slide decks (16:9 pages): the older
+                    `FitH` fits-to-width, which on a portrait-ish iframe
+                    leaves the bottom of the slide off-screen and forces
+                    a scrollbar inside the iframe — what we just fixed.
+                  - `toolbar=1` keeps the browser's PDF toolbar visible
+                    for page nav / zoom / download.
+                  - `navpanes=0` hides the sidebar (thumbnails / outline)
+                    so the slide takes the full panel width. */}
             <iframe
-              src={`${src}#toolbar=1&navpanes=0&view=FitH`}
+              src={`${src}#view=Fit&toolbar=1&navpanes=0`}
               title={label}
               className="h-full w-full"
               loading="lazy"
