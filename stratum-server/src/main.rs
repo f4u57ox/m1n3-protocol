@@ -760,12 +760,28 @@ async fn job_updater(state: Arc<ServerState>) {
                 }
 
                 // 2. Register a fresh template PDA for the new coinbase2 + branches.
+                //    If registration fails AFTER its internal retries, skip the
+                //    publish + notify entirely: pushing a `mining.notify` with an
+                //    empty `template_pda[9]` would make the sidecar silently drop
+                //    every share against this job (`stratum_proxy.rs:567`,
+                //    `template_id not tracked — dropped`) because the job never
+                //    gets inserted into the sidecar's tracking map. Miners keep
+                //    hashing on the previous job — `state.jobs` retains the
+                //    last 10 entries, so the prior job_id stays accept-able
+                //    well past the next ~30 s mempool-poll retry.
                 match state.sui.register_template(&updated).await {
                     Ok(new_tpda) => {
                         info!("New template PDA registered: {} (seq={})", new_tpda, new_seq);
                         updated.sui_template_id = Some(new_tpda);
                     }
-                    Err(e) => warn!("Template registration failed for seq={}: {}", new_seq, e),
+                    Err(e) => {
+                        warn!(
+                            "Template registration failed (seq={}); SKIPPING notify — \
+                             miners continue with prior job until next attempt: {}",
+                            new_seq, e
+                        );
+                        continue;
+                    }
                 }
 
                 // 3. Shift: old current → previous (kept active for stale-share acceptance).
@@ -837,13 +853,28 @@ async fn job_updater(state: Arc<ServerState>) {
                     });
                 }
 
-                // Register template on Sui so shares can be attributed
+                // Register template on Sui so shares can be attributed.
+                // Same guarantee as the merkle-only-update path above: if
+                // the registration's internal retries all fail, skip publish
+                // + notify so the ASIC's `mining.notify` never carries an
+                // empty `template_pda[9]` — that would make every share
+                // against this job get silently dropped at the sidecar's
+                // `template_id not tracked` branch. The prior NEW-BLOCK job
+                // stays in `state.jobs`; miners continue against it until
+                // bitcoind polls again.
                 match state.sui.register_template(&job).await {
                     Ok(tpda) => {
                         info!("Template registered on Sui: {}", tpda);
                         job.sui_template_id = Some(tpda);
                     }
-                    Err(e) => warn!("Template registration failed (shares won't be submitted): {}", e),
+                    Err(e) => {
+                        warn!(
+                            "Template registration failed on NEW BLOCK; SKIPPING notify — \
+                             miners continue with prior job until next attempt: {}",
+                            e
+                        );
+                        continue;
+                    }
                 }
 
                 // Wrap in Arc (Phase 4A)

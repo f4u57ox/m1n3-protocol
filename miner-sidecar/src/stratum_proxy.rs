@@ -1,7 +1,11 @@
 //! Stratum v1 proxy: intercepts mining.submit results and submits accepted
 //! shares directly to Sui using the miner's own keypair.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -11,7 +15,16 @@ use tokio::{
     sync::mpsc,
     time::interval,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Process-lifetime counter of shares we accepted upstream but had to drop
+/// locally because the job's on-chain `template_pda` was empty. Each
+/// increment is a lost-work event for the miner. Surfaced periodically by
+/// `batch_flusher` and on shutdown so silent drops aren't hidden in scroll-
+/// past warn lines. The companion stratum-server fix
+/// (`main.rs` template-register paths) prevents the upstream from ever
+/// publishing such a job; this counter is the defense-in-depth tripwire.
+pub(crate) static SILENTLY_DROPPED_SHARES: AtomicU64 = AtomicU64::new(0);
 
 use crate::{
     sui_sender::{PendingShare, SuiSender},
@@ -204,6 +217,14 @@ async fn batch_flusher(
     let mut ticker = interval(Duration::from_millis(batch_timeout_ms));
     ticker.tick().await; // consume the immediate first tick
 
+    // Heartbeat ticker that surfaces SILENTLY_DROPPED_SHARES once per minute
+    // when non-zero. The companion stratum-server fix should keep this at 0;
+    // any non-zero reading signals empty-`template_pda` notifies slipping
+    // through and needs operator attention.
+    let mut silent_drop_report = interval(Duration::from_secs(60));
+    silent_drop_report.tick().await;
+    let mut last_reported_drops: u64 = 0;
+
     loop {
         tokio::select! {
             cfg = cfg_rx.recv() => {
@@ -230,6 +251,18 @@ async fn batch_flusher(
                 }
             }
             _ = ticker.tick() => flush(&mut sender, &mut batch).await,
+            _ = silent_drop_report.tick() => {
+                let total = SILENTLY_DROPPED_SHARES.load(Ordering::Relaxed);
+                if total > last_reported_drops {
+                    warn!(
+                        "silent-drop heartbeat: {} shares lost cumulatively this session \
+                         (+{} since last report) — investigate stratum's template registration path",
+                        total,
+                        total - last_reported_drops,
+                    );
+                    last_reported_drops = total;
+                }
+            }
         }
     }
 }
@@ -249,11 +282,19 @@ fn is_transient_rpc_error(e: &anyhow::Error) -> bool {
         // Move abort — permanent. Retrying wouldn't help.
         return false;
     }
+    // "unavailable for consumption" / "needs to be rebuilt": the input objects'
+    // cached versions are off by one (typically from an aborted prior tx that
+    // still consumed locks). `MinerClient::exec` has already invalidated the
+    // specific cache entries the validator complained about via
+    // `parse_object_ids`, so the next flush will refetch fresh refs and succeed.
+    // Treat as transient so the share gets requeued instead of dropped.
     s.contains("timeout")
         || s.contains("connection reset")
         || s.contains("connection refused")
         || s.contains("transport error")
         || s.contains("decode error")
+        || s.contains("unavailable for consumption")
+        || s.contains("needs to be rebuilt")
 }
 
 async fn flush(sender: &mut SuiSender, batch: &mut Vec<(String, PendingShare)>) {
@@ -556,7 +597,24 @@ fn intercept_upstream(
         Some((tid, _)) => {
             let _ = share_tx.send((tid.clone(), share));
         }
-        None => warn!("Share accepted for job {} but template_id not tracked — dropped", job_id),
+        None => {
+            // The upstream stratum sent `mining.notify` for this job with an
+            // empty `template_pda[9]` (line 525 above only inserts when
+            // both id strings are non-empty). The ASIC's work for the next
+            // ~30 s job window is unrecoverable from the sidecar's side —
+            // there's no chain template_id to attach to a PTB. Surface as
+            // `error!` + tick the lifetime counter so this doesn't hide in
+            // log scrollback. The stratum-server's fix is to never publish
+            // such a job in the first place; this branch should be 0 hits.
+            SILENTLY_DROPPED_SHARES.fetch_add(1, Ordering::Relaxed);
+            error!(
+                "LOST SHARE: accepted for job {} but template_id not tracked — \
+                 upstream stratum sent mining.notify with empty template_pda \
+                 (cumulative lost shares this session: {})",
+                job_id,
+                SILENTLY_DROPPED_SHARES.load(Ordering::Relaxed),
+            );
+        }
     }
 }
 
