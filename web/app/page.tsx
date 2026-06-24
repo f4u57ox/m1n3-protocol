@@ -14,7 +14,7 @@ export default function HomePage() {
       <IntroSection />
       {/* Demo video sits between the explainer and the call-to-action.
           Lazy-loads YouTube only on click — no perf hit on first paint. */}
-      <DemoVideo videoId="vyFU3AD3row" />
+      <DemoVideo videoId="Woe61hCIej0" />
       <HomeCTA />
       {/* Minimized pitch-deck launcher anchored to the bottom-right.
           Visible from the moment the page paints; the 3 MB PDF stays
