@@ -104,22 +104,23 @@ Minimum solo setup: one `bitcoind` + one `stratum-server` + one `sidecar` + one 
 
 ## Deployment status
 
-### Mainnet — live
+### Mainnet — live (v4 — Sui Overflow 2026 submission)
 
 | Object | ID |
 |---|---|
-| m1n3 package | `0x640abaf8…31a588b77` |
-| Pool shared object | `0x545372ea…d8fbe4d` |
-| ShareDedupRegistry | `0x495732f0…2afa591` |
-| HashShareRegistry | `0x92d4eaa3…9f32f363` |
-| MinerRoundRegistry | `0x888c9616…be20a0e9a` |
-| M1N3Treasury | `0x0c93157a…5dccbe94` |
-| HashiRewardRegistry (inert until Hashi mainnet) | `0x99573a5e…2b890496c` |
-| UpgradeCap | `0xe4b7c916…933a0c70c` |
+| m1n3 package (`published-at`) | `0x2b259838…b771f9fea2` |
+| m1n3 package (`original-id`, event-type prefix) | `0x9a5e441a…7faac2012761` |
+| Pool shared object | `0x7ca199ca…e2bd73ba` |
+| ShareDedupRegistry | `0x9f029293…87ae8f0` |
+| HashShareRegistry | `0xffb857cf…a532fb2` |
+| HashShareMarketFeePool | `0x9464795f…99257e86` |
+| MinerRoundRegistry | `0xd887ce8a…cb37c84` |
+| HashiRewardRegistry (inert until Hashi mainnet) | `0x386970ab…ea215a` |
+| UpgradeCap | `0xd8204115…14a7043d3` |
 
 Live on mainnet: pool, share submission, template registration (operator + buyer modes), HashShare market with DeepBook V3 routing, the buyer-template lane (`register_template_public`, `submit_share_for_buyer_pay`), and the `ProtocolMPCConfig` registry that lets miners verify the BTC payout scriptPubKey off-chain against an on-chain source of truth.
 
-> **Note on versions.** The Sui Overflow 2026 submission targets the protocol as described above. A subsequent **v5** publish ships throughput improvements only — per-round share-dedup scoping (one `ShareDedup` per `(miner, round_id)` instead of per template, reducing per-share bootstrap txs), a `DerivedTemplate.round_id` field so the buyer-pay lane shares the same scoping, and a `MAX_MERKLE_BRANCHES` cap in `register_template_inner`. v5 is out of scope for the Overflow submission and changes no protocol semantics.
+> **Note on versions.** The Sui Overflow 2026 submission targets the v4 protocol as described above (IDs in the table). A subsequent **v5** publish (`0x640abaf8…31a588b77`, published 2026-06-21, after the Overflow submission deadline) ships throughput improvements only — per-round share-dedup scoping (one `ShareDedup` per `(miner, round_id)` instead of per template, reducing per-share bootstrap txs), a `DerivedTemplate.round_id` field so the buyer-pay lane shares the same scoping, and a `MAX_MERKLE_BRANCHES` cap in `register_template_inner`. v5 is out of scope for the Overflow submission and changes no protocol semantics.
 
 ### Not on mainnet yet (gated on upstream)
 
